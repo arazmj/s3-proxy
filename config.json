@@ -1,0 +1,22 @@
+{
+  "accounts": {
+    "account1": {
+      "endpoint_url": "http://account1:9000",
+      "region": "us-east-1",
+      "access_key_id": "minioadmin",
+      "secret_access_key": "minioadmin",
+      "buckets": ["bucket1", "bucket2"]
+    },
+    "account2": {
+      "endpoint_url": "http://account2:9000",
+      "region": "us-east-1",
+      "access_key_id": "minioadmin",
+      "secret_access_key": "minioadmin",
+      "buckets": ["bucket3", "bucket4"]
+    }
+  },
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0"
+  }
+} 
