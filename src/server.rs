@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, Extension},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, put},
@@ -15,6 +15,7 @@ use tracing::{info, instrument};
 use crate::config::Config;
 use crate::s3::S3Client;
 use crate::error::{AppError, Result};
+use crate::auth::{AuthState, auth_middleware, check_bucket_access, check_write_permission};
 
 pub struct AppState {
     pub config: Arc<Config>,
@@ -41,15 +42,24 @@ pub async fn create_router(state: AppState) -> Router {
         .route("/:bucket/*key", put(put_object))
         .route("/:bucket", get(list_objects))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            state.config.clone(),
+            auth_middleware,
+        ))
         .with_state(Arc::new(state))
 }
 
+#[axum::debug_handler]
 #[instrument(skip(state), fields(bucket = %bucket, key = %key))]
 async fn get_object(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse> {
     info!("Getting object {}/{}", bucket, key);
+    
+    // Check bucket access
+    check_bucket_access(&state.config, &auth.username, &bucket)?;
     
     let (_, client) = state.get_account_and_client(&bucket)?;
     let body = client.get_object(&bucket, &key).await?;
@@ -61,14 +71,20 @@ async fn get_object(
     Ok((StatusCode::OK, headers, bytes))
 }
 
+#[axum::debug_handler]
 #[instrument(skip(state, body), fields(bucket = %bucket, key = %key))]
 async fn put_object(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthState>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse> {
     info!("Putting object {}/{}", bucket, key);
+    
+    // Check bucket access and write permission
+    check_bucket_access(&state.config, &auth.username, &bucket)?;
+    check_write_permission(&state.config, &auth.username)?;
     
     let (_, client) = state.get_account_and_client(&bucket)?;
 
@@ -102,13 +118,18 @@ fn format_xml_content(objects: &[aws_sdk_s3::types::Object]) -> String {
         .join("\n")
 }
 
+#[axum::debug_handler]
 #[instrument(skip(state), fields(bucket = %bucket))]
 async fn list_objects(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthState>,
     Path(bucket): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse> {
     info!("Listing objects in bucket {}", bucket);
+    
+    // Check bucket access
+    check_bucket_access(&state.config, &auth.username, &bucket)?;
     
     let (_, client) = state.get_account_and_client(&bucket)?;
     let prefix = params.get("prefix").cloned();

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1.0", features = ["full"] }
 aws-config = "1.0"
 aws-sdk-s3 = "1.0"
@@ -17,4 +17,6 @@ thiserror = "1.0"
 anyhow = "1.0"
 tower = "0.4"
 futures = "0.3"
-bytes = "1.0" 
+bytes = "1.0"
+lazy_static = "1.4"
+http = "1.0" 

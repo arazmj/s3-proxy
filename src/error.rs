@@ -38,6 +38,13 @@ pub enum AppError {
     
     #[error("Internal server error: {0}")]
     InternalError(String),
+
+    // Authentication and authorization errors
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
 }
 
 impl IntoResponse for AppError {
@@ -78,6 +85,16 @@ impl IntoResponse for AppError {
             ),
             AppError::InternalError(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
+                e
+            ),
+
+            // Authentication and authorization errors
+            AppError::Unauthorized(e) => (
+                StatusCode::UNAUTHORIZED,
+                e
+            ),
+            AppError::InvalidRequest(e) => (
+                StatusCode::BAD_REQUEST,
                 e
             ),
         };

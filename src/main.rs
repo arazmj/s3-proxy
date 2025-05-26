@@ -2,29 +2,57 @@ mod config;
 mod s3;
 mod server;
 mod error;
+mod auth;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing::{info, Level};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tower_http::trace::{TraceLayer, DefaultMakeSpan, DefaultOnResponse};
+use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
+use axum::extract::Request;
 
 use crate::error::{AppError, Result};
 
+fn redact_sensitive_data(headers: &http::HeaderMap) -> String {
+    let mut redacted = String::new();
+    for (name, value) in headers.iter() {
+        let value = if name == "x-api-key" {
+            "***REDACTED***"
+        } else {
+            value.to_str().unwrap_or("***INVALID***")
+        };
+        redacted.push_str(&format!("{}: {}\n", name, value));
+    }
+    redacted
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
+    // Initialize tracing with custom format
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true);
+
+    let filter_layer = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new("info"))
+        .unwrap();
+
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        ))
-        .with(tracing_subscriber::fmt::layer())
+        .with(filter_layer)
+        .with(fmt_layer)
         .init();
 
     info!("Starting S3 proxy server");
 
     // Load configuration
     let config = Arc::new(config::Config::load("config.json")?);
-    info!("Loaded configuration with {} accounts", config.accounts.len());
+    info!("Loaded configuration with {} accounts and {} users", 
+        config.accounts.len(),
+        config.users.len()
+    );
 
     // Initialize S3 clients for each account
     let mut clients = HashMap::new();
@@ -39,11 +67,24 @@ async fn main() -> Result<()> {
         clients.insert(account_id.clone(), Arc::new(client));
     }
 
-    // Create router
+    // Create router with request logging
     let app = server::create_router(server::AppState {
         config: config.clone(),
         clients,
-    }).await;
+    }).await
+    .layer(
+        TraceLayer::new(SharedClassifier::new(ServerErrorsAsFailures::new()))
+            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+            .on_response(DefaultOnResponse::new().level(Level::INFO))
+            .on_request(|request: &Request<_>, _span: &tracing::Span| {
+                info!(
+                    method = %request.method(),
+                    uri = %request.uri(),
+                    headers = %redact_sensitive_data(request.headers()),
+                    "Request started"
+                );
+            })
+    );
 
     // Start server
     let addr = format!("{}:{}", config.server.host, config.server.port);
