@@ -4,6 +4,7 @@ use axum::{
     middleware::Next,
     response::Response,
     extract::State,
+    response::IntoResponse,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,6 +62,13 @@ lazy_static::lazy_static! {
 fn validate_request(config: &Config, request: &Request) -> Result<()> {
     // Check content length for PUT requests
     if request.method() == http::Method::PUT {
+        // Check write permissions
+        if let Some(api_key) = request.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
+            if let Some((username, _)) = config.find_user_by_api_key(api_key) {
+                check_write_permission(config, &username)?;
+            }
+        }
+
         if let Some(content_length) = request.headers().get(header::CONTENT_LENGTH) {
             if let Ok(s) = content_length.to_str() {
                 if let Ok(length) = s.parse::<u64>() {
@@ -90,32 +98,37 @@ pub async fn auth_middleware(
     State(config): State<Arc<Config>>,
     mut request: Request,
     next: Next,
-) -> Result<Response> {
+) -> Response {
     // Validate request
-    validate_request(&config, &request)?;
+    if let Err(e) = validate_request(&config, &request) {
+        return e.into_response();
+    }
 
     // Get API key from header
-    let api_key = request
+    let api_key = match request
         .headers()
         .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
+        .and_then(|v| v.to_str().ok()) {
+        Some(key) => key,
+        None => {
             warn!("No API key provided");
-            AppError::Unauthorized("No API key provided".to_string())
-        })?;
+            return AppError::Unauthorized("No API key provided".to_string()).into_response();
+        }
+    };
 
     // Find user by API key
-    let (username, user) = config
-        .find_user_by_api_key(api_key)
-        .ok_or_else(|| {
+    let (username, user) = match config.find_user_by_api_key(api_key) {
+        Some(u) => u,
+        None => {
             warn!("Invalid API key");
-            AppError::Unauthorized("Invalid API key".to_string())
-        })?;
+            return AppError::Unauthorized("Invalid API key".to_string()).into_response();
+        }
+    };
 
     // Check rate limit
     if RATE_LIMITER.write().await.is_rate_limited(&username) {
         warn!("Rate limit exceeded for user {}", username);
-        return Err(AppError::InvalidRequest("Rate limit exceeded".to_string()));
+        return AppError::Unauthorized("Rate limit exceeded".to_string()).into_response();
     }
 
     // Add auth state to request extensions
@@ -135,7 +148,7 @@ pub async fn auth_middleware(
     headers.insert("Strict-Transport-Security", "max-age=31536000; includeSubDomains".parse().unwrap());
 
     info!("Authenticated user: {} with role: {:?}", username, user.role);
-    Ok(response)
+    response
 }
 
 pub fn check_bucket_access(config: &Config, username: &str, bucket: &str) -> Result<()> {

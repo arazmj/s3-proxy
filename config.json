@@ -1,18 +1,11 @@
 {
   "accounts": {
-    "account1": {
-      "endpoint_url": "http://account1:9000",
+    "minio": {
+      "endpoint_url": "http://localhost:9000",
       "region": "us-east-1",
       "access_key_id": "minioadmin",
       "secret_access_key": "minioadmin",
-      "buckets": ["bucket1", "bucket2"]
-    },
-    "account2": {
-      "endpoint_url": "http://account2:9000",
-      "region": "us-east-1",
-      "access_key_id": "minioadmin",
-      "secret_access_key": "minioadmin",
-      "buckets": ["bucket3", "bucket4"]
+      "buckets": ["bucket1", "bucket2", "bucket3", "bucket4"]
     }
   },
   "users": {
@@ -24,16 +17,17 @@
     "user1": {
       "api_key": "user1-secret-key",
       "role": "user",
-      "allowed_buckets": ["bucket1", "bucket3"]
+      "allowed_buckets": ["bucket1"]
     },
     "readonly": {
       "api_key": "readonly-secret-key",
       "role": "readonly",
-      "allowed_buckets": ["bucket1", "bucket2", "bucket3", "bucket4"]
+      "allowed_buckets": ["bucket1"]
     }
   },
   "server": {
-    "port": 8080,
-    "host": "0.0.0.0"
-  }
+    "host": "127.0.0.1",
+    "port": 8080
+  },
+  "max_file_size": 104857600
 } 
