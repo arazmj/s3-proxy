@@ -21,6 +21,20 @@ pub struct AppState {
     pub clients: HashMap<String, Arc<S3Client>>,
 }
 
+impl AppState {
+    fn get_account_and_client(&self, bucket: &str) -> Result<(&str, &Arc<S3Client>)> {
+        let (account_id, _account_config) = self.config
+            .find_account_for_bucket(bucket)
+            .ok_or_else(|| AppError::BucketNotFound(bucket.to_string()))?;
+
+        let client = self.clients
+            .get(account_id)
+            .ok_or_else(|| AppError::InternalError("S3 client not found".to_string()))?;
+
+        Ok((account_id, client))
+    }
+}
+
 pub async fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/:bucket/*key", get(get_object))
@@ -37,14 +51,7 @@ async fn get_object(
 ) -> Result<impl IntoResponse> {
     info!("Getting object {}/{}", bucket, key);
     
-    let (account_id, _account_config) = state.config
-        .find_account_for_bucket(&bucket)
-        .ok_or_else(|| AppError::BucketNotFound(bucket.clone()))?;
-
-    let client = state.clients
-        .get(account_id)
-        .ok_or_else(|| AppError::InternalError("S3 client not found".to_string()))?;
-
+    let (_, client) = state.get_account_and_client(&bucket)?;
     let body = client.get_object(&bucket, &key).await?;
     let bytes = body.collect().await.map_err(|e| AppError::InternalError(e.to_string()))?.to_vec();
     
@@ -63,13 +70,7 @@ async fn put_object(
 ) -> Result<impl IntoResponse> {
     info!("Putting object {}/{}", bucket, key);
     
-    let (account_id, _account_config) = state.config
-        .find_account_for_bucket(&bucket)
-        .ok_or_else(|| AppError::BucketNotFound(bucket.clone()))?;
-
-    let client = state.clients
-        .get(account_id)
-        .ok_or_else(|| AppError::InternalError("S3 client not found".to_string()))?;
+    let (_, client) = state.get_account_and_client(&bucket)?;
 
     let content_type = headers
         .get("content-type")
@@ -82,6 +83,25 @@ async fn put_object(
     Ok(StatusCode::OK)
 }
 
+fn format_xml_content(objects: &[aws_sdk_s3::types::Object]) -> String {
+    objects
+        .iter()
+        .map(|obj| {
+            format!(
+                r#"        <Contents>
+            <Key>{}</Key>
+            <Size>{}</Size>
+            <LastModified>{}</LastModified>
+        </Contents>"#,
+                obj.key().unwrap_or_default(),
+                obj.size().unwrap_or(0),
+                obj.last_modified().map(|dt| dt.to_string()).unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[instrument(skip(state), fields(bucket = %bucket))]
 async fn list_objects(
     State(state): State<Arc<AppState>>,
@@ -90,16 +110,8 @@ async fn list_objects(
 ) -> Result<impl IntoResponse> {
     info!("Listing objects in bucket {}", bucket);
     
-    let (account_id, _account_config) = state.config
-        .find_account_for_bucket(&bucket)
-        .ok_or_else(|| AppError::BucketNotFound(bucket.clone()))?;
-
-    let client = state.clients
-        .get(account_id)
-        .ok_or_else(|| AppError::InternalError("S3 client not found".to_string()))?;
-
+    let (_, client) = state.get_account_and_client(&bucket)?;
     let prefix = params.get("prefix").cloned();
-    
     let objects = client.list_objects(&bucket, prefix.clone()).await?;
     
     let xml = format!(
@@ -107,22 +119,11 @@ async fn list_objects(
 <ListBucketResult>
     <Name>{}</Name>
     <Prefix>{}</Prefix>
-    <Contents>
-        {}
-    </Contents>
+{}
 </ListBucketResult>"#,
         bucket,
         prefix.unwrap_or_default(),
-        objects
-            .iter()
-            .map(|obj| format!(
-                r#"<Key>{}</Key><Size>{}</Size><LastModified>{}</LastModified>"#,
-                obj.key().unwrap_or_default(),
-                obj.size().unwrap_or(0),
-                obj.last_modified().map(|dt| dt.to_string()).unwrap_or_default()
-            ))
-            .collect::<Vec<_>>()
-            .join("\n")
+        format_xml_content(&objects)
     );
     
     let mut headers = HeaderMap::new();
