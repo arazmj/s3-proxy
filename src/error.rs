@@ -2,6 +2,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use serde::Serialize;
 use thiserror::Error;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::{
@@ -99,11 +100,14 @@ impl IntoResponse for AppError {
             ),
         };
 
-        let body = format!(
-            r#"{{"error": "{}", "status": {}}}"#,
-            error_message,
-            status.as_u16()
-        );
+        let body = ErrorBody {
+            error: &error_message,
+            status: status.as_u16(),
+        };
+        // serde_json::to_string never fails for this struct, but fall back
+        // to a static safe payload just in case.
+        let body = serde_json::to_string(&body)
+            .unwrap_or_else(|_| r#"{"error":"internal error","status":500}"#.to_string());
 
         let mut response = (status, body).into_response();
         response.headers_mut().insert(
@@ -114,4 +118,54 @@ impl IntoResponse for AppError {
     }
 }
 
-pub type Result<T> = std::result::Result<T, AppError>; 
+#[derive(Serialize)]
+struct ErrorBody<'a> {
+    error: &'a str,
+    status: u16,
+}
+
+pub type Result<T> = std::result::Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use serde_json::Value;
+
+    async fn body_to_json(resp: Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).expect("response body must be valid JSON");
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn quote_in_message_does_not_break_json() {
+        // A bucket name with a double-quote in it would previously produce
+        // "{\"error\": \"Bucket not found: foo\"bar\", \"status\": 404}", which
+        // is not parseable JSON. With proper serialization the quote is
+        // escaped and the response stays valid.
+        let err = AppError::BucketNotFound("foo\"bar".to_string());
+        let (status, json) = body_to_json(err.into_response()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["status"], 404);
+        assert_eq!(json["error"], "Bucket not found: foo\"bar");
+    }
+
+    #[tokio::test]
+    async fn backslash_and_newline_in_message_are_escaped() {
+        let err = AppError::InternalError("line1\nline2\\end".to_string());
+        let (status, json) = body_to_json(err.into_response()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["error"], "line1\nline2\\end");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_status_is_401() {
+        let err = AppError::Unauthorized("nope".to_string());
+        let (status, json) = body_to_json(err.into_response()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json["status"], 401);
+        assert_eq!(json["error"], "nope");
+    }
+}
