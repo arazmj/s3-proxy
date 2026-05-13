@@ -83,15 +83,119 @@ fn validate_request(config: &Config, request: &Request) -> Result<()> {
         }
     }
 
-    // Validate path components
+    // Validate path components.
+    //
+    // Routes are `/<bucket>` (list) and `/<bucket>/<key>` where `<key>` is
+    // matched by the `*key` wildcard and may itself contain `/` (e.g.
+    // `/mybucket/path/to/file.txt`). We therefore allow any number of
+    // segments after the bucket, but still reject:
+    //   - empty paths
+    //   - empty bucket name
+    //   - empty intermediate/trailing segments (e.g. `//`, trailing `/`)
+    //   - `.` / `..` segments (defense in depth against path traversal)
     if let Some(path) = request.uri().path().strip_prefix('/') {
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.is_empty() || parts.len() > 2 {
+        if path.is_empty() {
             return Err(AppError::InvalidRequest("Invalid path format".to_string()));
         }
+        let parts: Vec<&str> = path.split('/').collect();
+        let bucket = parts[0];
+        if bucket.is_empty() {
+            return Err(AppError::InvalidRequest("Invalid path format".to_string()));
+        }
+        for segment in &parts[1..] {
+            if segment.is_empty() || *segment == "." || *segment == ".." {
+                return Err(AppError::InvalidRequest("Invalid path format".to_string()));
+            }
+        }
+    } else {
+        return Err(AppError::InvalidRequest("Invalid path format".to_string()));
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use std::collections::HashMap;
+
+    fn make_config() -> Config {
+        // Build a minimal config by deserializing JSON to avoid relying on
+        // private struct construction.
+        let json = r#"{
+            "accounts": {},
+            "users": {},
+            "server": { "host": "127.0.0.1", "port": 8080 }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("valid config");
+        // Sanity: defaults applied.
+        let _ = cfg.max_file_size;
+        cfg
+    }
+
+    fn req(method: http::Method, path: &str) -> Request {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn list_bucket_path_is_valid() {
+        let cfg = make_config();
+        validate_request(&cfg, &req(http::Method::GET, "/mybucket")).expect("should accept");
+    }
+
+    #[test]
+    fn flat_object_key_is_valid() {
+        let cfg = make_config();
+        validate_request(&cfg, &req(http::Method::GET, "/mybucket/file.txt"))
+            .expect("should accept");
+    }
+
+    #[test]
+    fn nested_object_key_is_valid() {
+        // Regression: previously rejected with "Invalid path format" because
+        // the path has more than two `/`-separated segments.
+        let cfg = make_config();
+        validate_request(
+            &cfg,
+            &req(http::Method::GET, "/mybucket/path/to/deeply/nested/file.txt"),
+        )
+        .expect("nested object keys must be allowed");
+    }
+
+    #[test]
+    fn empty_path_is_rejected() {
+        let cfg = make_config();
+        assert!(validate_request(&cfg, &req(http::Method::GET, "/")).is_err());
+    }
+
+    #[test]
+    fn empty_bucket_is_rejected() {
+        let cfg = make_config();
+        assert!(validate_request(&cfg, &req(http::Method::GET, "//key")).is_err());
+    }
+
+    #[test]
+    fn double_slash_in_key_is_rejected() {
+        let cfg = make_config();
+        assert!(validate_request(&cfg, &req(http::Method::GET, "/bucket/a//b")).is_err());
+    }
+
+    #[test]
+    fn dotdot_segment_is_rejected() {
+        let cfg = make_config();
+        assert!(validate_request(&cfg, &req(http::Method::GET, "/bucket/../etc/passwd")).is_err());
+    }
+
+    // Suppress unused-import warnings for items only used in non-test code.
+    #[allow(dead_code)]
+    fn _unused_imports_marker() {
+        let _ = HashMap::<String, String>::new();
+    }
 }
 
 pub async fn auth_middleware(
