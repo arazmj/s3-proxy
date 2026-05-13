@@ -99,19 +99,41 @@ async fn put_object(
     Ok(StatusCode::OK)
 }
 
+fn escape_xml(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn format_last_modified(obj: &aws_sdk_s3::types::Object) -> String {
+    use aws_sdk_s3::primitives::DateTimeFormat;
+    obj.last_modified()
+        .and_then(|dt| dt.fmt(DateTimeFormat::DateTime).ok())
+        .unwrap_or_default()
+}
+
 fn format_xml_content(objects: &[aws_sdk_s3::types::Object]) -> String {
     objects
         .iter()
         .map(|obj| {
             format!(
-                r#"        <Contents>
-            <Key>{}</Key>
-            <Size>{}</Size>
-            <LastModified>{}</LastModified>
-        </Contents>"#,
-                obj.key().unwrap_or_default(),
+                r#"    <Contents>
+        <Key>{}</Key>
+        <Size>{}</Size>
+        <LastModified>{}</LastModified>
+    </Contents>"#,
+                escape_xml(obj.key().unwrap_or_default()),
                 obj.size().unwrap_or(0),
-                obj.last_modified().map(|dt| dt.to_string()).unwrap_or_default()
+                format_last_modified(obj),
             )
         })
         .collect::<Vec<_>>()
@@ -134,21 +156,50 @@ async fn list_objects(
     let (_, client) = state.get_account_and_client(&bucket)?;
     let prefix = params.get("prefix").cloned();
     let objects = client.list_objects(&bucket, prefix.clone()).await?;
-    
+
+    let key_count = objects.len();
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult>
-    <Name>{}</Name>
-    <Prefix>{}</Prefix>
-{}
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>{name}</Name>
+    <Prefix>{prefix}</Prefix>
+    <KeyCount>{key_count}</KeyCount>
+    <MaxKeys>{key_count}</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+{contents}
 </ListBucketResult>"#,
-        bucket,
-        prefix.unwrap_or_default(),
-        format_xml_content(&objects)
+        name = escape_xml(&bucket),
+        prefix = escape_xml(&prefix.unwrap_or_default()),
+        key_count = key_count,
+        contents = format_xml_content(&objects),
     );
-    
+
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "application/xml".parse().unwrap());
-    
+
     Ok((StatusCode::OK, headers, xml))
-} 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_xml_handles_all_special_chars() {
+        assert_eq!(
+            escape_xml(r#"a&b<c>d"e'f"#),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
+    }
+
+    #[test]
+    fn escape_xml_passes_through_safe_text() {
+        assert_eq!(escape_xml("plain/path/to/file.txt"), "plain/path/to/file.txt");
+    }
+
+    #[test]
+    fn escape_xml_does_not_double_escape() {
+        // Each special char should produce exactly one entity.
+        assert_eq!(escape_xml("&amp;"), "&amp;amp;");
+    }
+}
