@@ -6,13 +6,12 @@ use axum::{
     extract::State,
     response::IntoResponse,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
-use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, RateLimitConfig};
 use crate::error::{AppError, Result};
 
 #[derive(Debug, Clone)]
@@ -34,29 +33,44 @@ impl RateLimiter {
         }
     }
 
-    fn is_rate_limited(&mut self, username: &str) -> bool {
+    /// Returns `true` when `username` has already made `cfg.max_requests`
+    /// requests within the trailing `cfg.window_secs` seconds.
+    ///
+    /// A `max_requests` of `0` disables the limiter entirely.
+    fn is_rate_limited(&mut self, username: &str, cfg: RateLimitConfig) -> bool {
+        if cfg.max_requests == 0 {
+            return false;
+        }
+
         let now = Instant::now();
-        let window = Duration::from_secs(60); // 1 minute window
-        let max_requests = 100; // max requests per minute
+        let window = Duration::from_secs(cfg.window_secs);
+        let max_requests = cfg.max_requests as usize;
+
+        // Clean up users whose entire window has expired so the map doesn't
+        // accumulate stale `Vec<Instant>` allocations for one-shot callers.
+        self.requests
+            .retain(|_, times| times.iter().any(|&t| now.duration_since(t) < window));
 
         let requests = self.requests.entry(username.to_string()).or_default();
-        
-        // Remove old requests
         requests.retain(|&time| now.duration_since(time) < window);
-        
-        // Check if rate limited
+
         if requests.len() >= max_requests {
             return true;
         }
-        
-        // Add new request
+
         requests.push(now);
         false
     }
 }
 
-lazy_static::lazy_static! {
-    static ref RATE_LIMITER: RwLock<RateLimiter> = RwLock::new(RateLimiter::new());
+// Global rate-limiter state. A `std::sync::Mutex` is fine here because the
+// critical section is short, synchronous, and never `.await`s — using
+// `tokio::sync::RwLock` (which we did before) was misleading since every call
+// took the write lock anyway.
+fn rate_limiter() -> &'static Mutex<RateLimiter> {
+    use std::sync::OnceLock;
+    static INSTANCE: OnceLock<Mutex<RateLimiter>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(RateLimiter::new()))
 }
 
 fn validate_request(config: &Config, request: &Request) -> Result<()> {
@@ -134,6 +148,10 @@ mod tests {
         cfg
     }
 
+    fn rate_cfg(max_requests: u32, window_secs: u64) -> RateLimitConfig {
+        RateLimitConfig { max_requests, window_secs }
+    }
+
     fn req(method: http::Method, path: &str) -> Request {
         Request::builder()
             .method(method)
@@ -196,6 +214,86 @@ mod tests {
     fn _unused_imports_marker() {
         let _ = HashMap::<String, String>::new();
     }
+
+    #[test]
+    fn rate_limiter_allows_under_limit() {
+        let mut rl = RateLimiter::new();
+        let cfg = rate_cfg(3, 60);
+        for _ in 0..3 {
+            assert!(!rl.is_rate_limited("alice", cfg));
+        }
+    }
+
+    #[test]
+    fn rate_limiter_blocks_at_limit() {
+        let mut rl = RateLimiter::new();
+        let cfg = rate_cfg(2, 60);
+        assert!(!rl.is_rate_limited("alice", cfg));
+        assert!(!rl.is_rate_limited("alice", cfg));
+        // 3rd request in the window must be rejected.
+        assert!(rl.is_rate_limited("alice", cfg));
+        // Successive checks while still over the limit also fail and do NOT
+        // accumulate further timestamps for the user.
+        assert!(rl.is_rate_limited("alice", cfg));
+    }
+
+    #[test]
+    fn rate_limiter_isolates_users() {
+        let mut rl = RateLimiter::new();
+        let cfg = rate_cfg(1, 60);
+        assert!(!rl.is_rate_limited("alice", cfg));
+        assert!(rl.is_rate_limited("alice", cfg));
+        // Bob has his own bucket and is unaffected by Alice's traffic.
+        assert!(!rl.is_rate_limited("bob", cfg));
+    }
+
+    #[test]
+    fn rate_limiter_recovers_after_window() {
+        let mut rl = RateLimiter::new();
+        // 1-request-per-1-second window.
+        let cfg = rate_cfg(1, 1);
+        assert!(!rl.is_rate_limited("alice", cfg));
+        assert!(rl.is_rate_limited("alice", cfg));
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            !rl.is_rate_limited("alice", cfg),
+            "request after the window elapses must be allowed"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_zero_max_disables_limit() {
+        let mut rl = RateLimiter::new();
+        let cfg = rate_cfg(0, 60);
+        for _ in 0..1_000 {
+            assert!(!rl.is_rate_limited("alice", cfg));
+        }
+        // And no state should be retained for the user when the limiter is
+        // disabled — saves memory and avoids surprising side-effects.
+        assert!(rl.requests.is_empty());
+    }
+
+    #[test]
+    fn rate_limiter_reclaims_idle_users() {
+        // Per-user `Vec<Instant>` allocations should not pile up forever for
+        // callers that go silent: once their entire window has expired, the
+        // map entry is removed on the next call by any user.
+        let mut rl = RateLimiter::new();
+        let cfg = rate_cfg(5, 1);
+        for _ in 0..3 {
+            assert!(!rl.is_rate_limited("alice", cfg));
+        }
+        assert_eq!(rl.requests.len(), 1);
+        std::thread::sleep(Duration::from_millis(1100));
+
+        // A request from a different user should evict alice's stale entry.
+        assert!(!rl.is_rate_limited("bob", cfg));
+        assert!(
+            !rl.requests.contains_key("alice"),
+            "stale entry for alice must be reclaimed; map = {:?}",
+            rl.requests.keys().collect::<Vec<_>>()
+        );
+    }
 }
 
 pub async fn auth_middleware(
@@ -230,9 +328,13 @@ pub async fn auth_middleware(
     };
 
     // Check rate limit
-    if RATE_LIMITER.write().await.is_rate_limited(&username) {
+    let limited = {
+        let mut limiter = rate_limiter().lock().expect("rate limiter mutex poisoned");
+        limiter.is_rate_limited(&username, config.rate_limit)
+    };
+    if limited {
         warn!("Rate limit exceeded for user {}", username);
-        return AppError::Unauthorized("Rate limit exceeded".to_string()).into_response();
+        return AppError::RateLimited("Rate limit exceeded".to_string()).into_response();
     }
 
     // Add auth state to request extensions

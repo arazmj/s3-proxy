@@ -46,6 +46,9 @@ pub enum AppError {
 
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+
+    #[error("Too many requests: {0}")]
+    RateLimited(String),
 }
 
 impl IntoResponse for AppError {
@@ -96,6 +99,10 @@ impl IntoResponse for AppError {
             ),
             AppError::InvalidRequest(e) => (
                 StatusCode::BAD_REQUEST,
+                e
+            ),
+            AppError::RateLimited(e) => (
+                StatusCode::TOO_MANY_REQUESTS,
                 e
             ),
         };
