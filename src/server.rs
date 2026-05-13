@@ -8,7 +8,6 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower_http::trace::TraceLayer;
 use aws_sdk_s3::primitives::ByteStream;
 use tracing::{info, instrument};
 
@@ -41,7 +40,6 @@ pub async fn create_router(state: AppState) -> Router {
         .route("/:bucket/*key", get(get_object))
         .route("/:bucket/*key", put(put_object))
         .route("/:bucket", get(list_objects))
-        .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(
             state.config.clone(),
             auth_middleware,
