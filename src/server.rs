@@ -1,7 +1,8 @@
 use axum::{
     body::Bytes,
     extract::{Path, Query, State, Extension},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware,
     response::IntoResponse,
     routing::{get, put},
     Router,
@@ -9,6 +10,7 @@ use axum::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use aws_sdk_s3::primitives::ByteStream;
+use metrics_exporter_prometheus::PrometheusHandle;
 use tracing::{info, instrument};
 
 use crate::config::Config;
@@ -19,6 +21,7 @@ use crate::auth::{AuthState, auth_middleware, check_bucket_access, check_write_p
 pub struct AppState {
     pub config: Arc<Config>,
     pub clients: HashMap<String, Arc<S3Client>>,
+    pub prometheus_handle: PrometheusHandle,
 }
 
 impl AppState {
@@ -36,15 +39,33 @@ impl AppState {
 }
 
 pub async fn create_router(state: AppState) -> Router {
-    Router::new()
+    let config = state.config.clone();
+    let state = Arc::new(state);
+
+    let protected_routes = Router::new()
         .route("/:bucket/*key", get(get_object))
         .route("/:bucket/*key", put(put_object))
         .route("/:bucket", get(list_objects))
-        .layer(axum::middleware::from_fn_with_state(
-            state.config.clone(),
+        .route_layer(middleware::from_fn_with_state(
+            config,
             auth_middleware,
         ))
-        .with_state(Arc::new(state))
+        .route_layer(middleware::from_fn(crate::metrics::record_http_metrics));
+
+    Router::new()
+        .route("/metrics", get(metrics_handler))
+        .merge(protected_routes)
+        .with_state(state)
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+
+    (StatusCode::OK, headers, state.prometheus_handle.render())
 }
 
 #[axum::debug_handler]
@@ -181,6 +202,49 @@ async fn list_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use tower05::ServiceExt;
+
+    fn test_state() -> AppState {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        AppState {
+            config: Arc::new(Config {
+                accounts: HashMap::new(),
+                users: HashMap::new(),
+                server: crate::config::ServerConfig {
+                    host: "127.0.0.1".to_owned(),
+                    port: 0,
+                },
+                max_file_size: 1024,
+            }),
+            clients: HashMap::new(),
+            prometheus_handle: recorder.handle(),
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_is_plain_text_and_unauthenticated() {
+        let app = create_router(test_state()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; version=0.0.4"
+        );
+    }
 
     #[test]
     fn escape_xml_handles_all_special_chars() {

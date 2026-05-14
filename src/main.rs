@@ -3,6 +3,7 @@ mod s3;
 mod server;
 mod error;
 mod auth;
+mod metrics;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use tower_http::trace::{TraceLayer, DefaultMakeSpan, DefaultOnResponse};
 use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
 use axum::extract::Request;
+use metrics_exporter_prometheus::PrometheusBuilder;
 
 use crate::error::{AppError, Result};
 
@@ -47,6 +49,10 @@ async fn main() -> Result<()> {
 
     info!("Starting S3 proxy server");
 
+    let prometheus_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| AppError::InternalError(format!("Failed to install Prometheus recorder: {}", e)))?;
+
     // Load configuration
     let config = Arc::new(config::Config::load("config.json")?);
     info!("Loaded configuration with {} accounts and {} users", 
@@ -71,6 +77,7 @@ async fn main() -> Result<()> {
     let app = server::create_router(server::AppState {
         config: config.clone(),
         clients,
+        prometheus_handle,
     }).await
     .layer(
         TraceLayer::new(SharedClassifier::new(ServerErrorsAsFailures::new()))
