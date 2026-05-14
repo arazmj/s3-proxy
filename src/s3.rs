@@ -1,6 +1,7 @@
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{
     config::Credentials,
+    operation::get_object::GetObjectOutput,
     primitives::ByteStream,
     types::Object,
     Client,
@@ -73,7 +74,7 @@ impl S3Client {
     }
 
     #[instrument(skip(self), fields(bucket = %bucket, key = %key))]
-    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<ByteStream> {
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<GetObjectOutput> {
         info!("Getting object {}/{}", bucket, key);
         
         match self
@@ -84,7 +85,7 @@ impl S3Client {
             .send()
             .await
         {
-            Ok(response) => Ok(response.body),
+            Ok(response) => Ok(response),
             Err(e) => {
                 if let SdkError::ServiceError(context) = &e {
                     if context.err().is_no_such_key() {
