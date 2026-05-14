@@ -1,14 +1,10 @@
 use axum::{
-    extract::Request,
-    http::header,
-    middleware::Next,
+    extract::Request, extract::State, http::header, middleware::Next, response::IntoResponse,
     response::Response,
-    extract::State,
-    response::IntoResponse,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -40,15 +36,15 @@ impl RateLimiter {
         let max_requests = 100; // max requests per minute
 
         let requests = self.requests.entry(username.to_string()).or_default();
-        
+
         // Remove old requests
         requests.retain(|&time| now.duration_since(time) < window);
-        
+
         // Check if rate limited
         if requests.len() >= max_requests {
             return true;
         }
-        
+
         // Add new request
         requests.push(now);
         false
@@ -63,9 +59,13 @@ fn validate_request(config: &Config, request: &Request) -> Result<()> {
     // Check content length for PUT requests
     if request.method() == http::Method::PUT {
         // Check write permissions
-        if let Some(api_key) = request.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
+        if let Some(api_key) = request
+            .headers()
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+        {
             if let Some((username, _)) = config.find_user_by_api_key(api_key) {
-                check_write_permission(config, &username)?;
+                check_write_permission(config, username)?;
             }
         }
 
@@ -111,6 +111,90 @@ fn validate_request(config: &Config, request: &Request) -> Result<()> {
         return Err(AppError::InvalidRequest("Invalid path format".to_string()));
     }
 
+    Ok(())
+}
+
+pub async fn auth_middleware(
+    State(config): State<Arc<Config>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    // Validate request
+    if let Err(e) = validate_request(&config, &request) {
+        return e.into_response();
+    }
+
+    // Get API key from header
+    let api_key = match request
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(key) => key,
+        None => {
+            warn!("No API key provided");
+            return AppError::Unauthorized("No API key provided".to_string()).into_response();
+        }
+    };
+
+    // Find user by API key
+    let (username, user) = match config.find_user_by_api_key(api_key) {
+        Some(u) => u,
+        None => {
+            warn!("Invalid API key");
+            return AppError::Unauthorized("Invalid API key".to_string()).into_response();
+        }
+    };
+
+    // Check rate limit
+    if RATE_LIMITER.write().await.is_rate_limited(username) {
+        warn!("Rate limit exceeded for user {username}");
+        return AppError::Unauthorized("Rate limit exceeded".to_string()).into_response();
+    }
+
+    // Add auth state to request extensions
+    request.extensions_mut().insert(AuthState {
+        username: username.to_string(),
+        role: format!("{:?}", user.role),
+    });
+
+    // Process the request
+    let mut response = next.run(request).await;
+
+    // Add secure headers
+    let headers = response.headers_mut();
+    headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
+    headers.insert(
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains".parse().unwrap(),
+    );
+
+    info!(
+        "Authenticated user: {} with role: {:?}",
+        username, user.role
+    );
+    response
+}
+
+pub fn check_bucket_access(config: &Config, username: &str, bucket: &str) -> Result<()> {
+    if !config.is_bucket_allowed(username, bucket) {
+        warn!("User {username} not allowed to access bucket {bucket}");
+        return Err(AppError::Unauthorized(format!(
+            "Not allowed to access bucket: {bucket}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn check_write_permission(config: &Config, username: &str) -> Result<()> {
+    if !config.can_write(username) {
+        warn!("User {username} not allowed to write");
+        return Err(AppError::Unauthorized(
+            "Write permission denied".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -162,7 +246,10 @@ mod tests {
         let cfg = make_config();
         validate_request(
             &cfg,
-            &req(http::Method::GET, "/mybucket/path/to/deeply/nested/file.txt"),
+            &req(
+                http::Method::GET,
+                "/mybucket/path/to/deeply/nested/file.txt",
+            ),
         )
         .expect("nested object keys must be allowed");
     }
@@ -197,79 +284,3 @@ mod tests {
         let _ = HashMap::<String, String>::new();
     }
 }
-
-pub async fn auth_middleware(
-    State(config): State<Arc<Config>>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    // Validate request
-    if let Err(e) = validate_request(&config, &request) {
-        return e.into_response();
-    }
-
-    // Get API key from header
-    let api_key = match request
-        .headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok()) {
-        Some(key) => key,
-        None => {
-            warn!("No API key provided");
-            return AppError::Unauthorized("No API key provided".to_string()).into_response();
-        }
-    };
-
-    // Find user by API key
-    let (username, user) = match config.find_user_by_api_key(api_key) {
-        Some(u) => u,
-        None => {
-            warn!("Invalid API key");
-            return AppError::Unauthorized("Invalid API key".to_string()).into_response();
-        }
-    };
-
-    // Check rate limit
-    if RATE_LIMITER.write().await.is_rate_limited(&username) {
-        warn!("Rate limit exceeded for user {}", username);
-        return AppError::Unauthorized("Rate limit exceeded".to_string()).into_response();
-    }
-
-    // Add auth state to request extensions
-    request.extensions_mut().insert(AuthState {
-        username: username.to_string(),
-        role: format!("{:?}", user.role),
-    });
-
-    // Process the request
-    let mut response = next.run(request).await;
-
-    // Add secure headers
-    let headers = response.headers_mut();
-    headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
-    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
-    headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
-    headers.insert("Strict-Transport-Security", "max-age=31536000; includeSubDomains".parse().unwrap());
-
-    info!("Authenticated user: {} with role: {:?}", username, user.role);
-    response
-}
-
-pub fn check_bucket_access(config: &Config, username: &str, bucket: &str) -> Result<()> {
-    if !config.is_bucket_allowed(username, bucket) {
-        warn!("User {} not allowed to access bucket {}", username, bucket);
-        return Err(AppError::Unauthorized(format!(
-            "Not allowed to access bucket: {}",
-            bucket
-        )));
-    }
-    Ok(())
-}
-
-pub fn check_write_permission(config: &Config, username: &str) -> Result<()> {
-    if !config.can_write(username) {
-        warn!("User {} not allowed to write", username);
-        return Err(AppError::Unauthorized("Write permission denied".to_string()));
-    }
-    Ok(())
-} 
