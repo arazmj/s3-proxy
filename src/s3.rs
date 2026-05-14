@@ -1,12 +1,21 @@
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{
     config::Credentials,
-    primitives::ByteStream,
+    primitives::{ByteStream, DateTimeFormat},
     types::Object,
     Client,
     error::SdkError,
 };
 use tracing::{info, instrument};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadObjectMetadata {
+    pub content_length: Option<i64>,
+    pub content_type: Option<String>,
+    pub e_tag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_encoding: Option<String>,
+}
 
 use crate::error::{AppError, Result};
 
@@ -92,6 +101,38 @@ impl S3Client {
                     }
                 }
                 Err(e.into())
+            }
+        }
+    }
+
+    #[instrument(skip(self), fields(bucket = %bucket, key = %key))]
+    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectMetadata> {
+        info!("Getting object metadata {}/{}", bucket, key);
+
+        match self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(response) => Ok(HeadObjectMetadata {
+                content_length: response.content_length(),
+                content_type: response.content_type().map(String::from),
+                e_tag: response.e_tag().map(String::from),
+                last_modified: response
+                    .last_modified()
+                    .and_then(|dt| dt.fmt(DateTimeFormat::HttpDate).ok()),
+                content_encoding: response.content_encoding().map(String::from),
+            }),
+            Err(e) => {
+                if let SdkError::ServiceError(context) = &e {
+                    if context.err().is_not_found() {
+                        return Err(AppError::ObjectNotFound(bucket.to_string(), key.to_string()));
+                    }
+                }
+                Err(AppError::InternalError(format!("S3 HeadObject error: {}", e)))
             }
         }
     }
