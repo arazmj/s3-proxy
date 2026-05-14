@@ -14,6 +14,22 @@ pub struct S3Client {
     client: Client,
 }
 
+#[derive(Debug)]
+pub struct ListObjectsParams {
+    pub prefix: Option<String>,
+    pub start_after: Option<String>,
+    pub continuation_token: Option<String>,
+    pub max_keys: i32,
+}
+
+#[derive(Debug)]
+pub struct ListObjectsPage {
+    pub objects: Vec<Object>,
+    pub is_truncated: bool,
+    pub next_continuation_token: Option<String>,
+    pub key_count: i32,
+}
+
 impl S3Client {
     #[instrument(skip(endpoint_url, region, access_key_id, secret_access_key))]
     pub async fn new(
@@ -41,35 +57,44 @@ impl S3Client {
         Ok(Self { client })
     }
 
-    #[instrument(skip(self), fields(bucket = %bucket))]
-    pub async fn list_objects(&self, bucket: &str, prefix: Option<String>) -> Result<Vec<Object>> {
-        info!("Listing objects in bucket {} with prefix {:?}", bucket, prefix);
-        
-        let mut objects = Vec::new();
-        let mut continuation_token = None;
+    #[instrument(skip(self, params), fields(bucket = %bucket))]
+    pub async fn list_objects(&self, bucket: &str, params: ListObjectsParams) -> Result<ListObjectsPage> {
+        let max_keys = match params.max_keys {
+            1..=1000 => params.max_keys,
+            n if n > 1000 => 1000,
+            _ => return Err(AppError::InvalidRequest("max-keys must be at least 1".to_string())),
+        };
 
-        loop {
-            let response = self
-                .client
-                .list_objects_v2()
-                .bucket(bucket)
-                .set_prefix(prefix.clone())
-                .set_continuation_token(continuation_token)
-                .send()
-                .await?;
+        info!(
+            "Listing objects in bucket {} with prefix {:?}, start-after {:?}, continuation-token {:?}, max-keys {}",
+            bucket, params.prefix, params.start_after, params.continuation_token, max_keys
+        );
 
-            if let Some(contents) = response.contents {
-                objects.extend(contents);
-            }
+        let response = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .set_prefix(params.prefix)
+            .set_start_after(params.start_after)
+            .set_continuation_token(params.continuation_token)
+            .set_max_keys(Some(max_keys))
+            .send()
+            .await?;
 
-            continuation_token = response.next_continuation_token;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
+        let objects = response.contents.unwrap_or_default();
+        let key_count = response.key_count.unwrap_or(objects.len() as i32);
+        let page = ListObjectsPage {
+            objects,
+            is_truncated: response.is_truncated.unwrap_or(false),
+            next_continuation_token: response.next_continuation_token,
+            key_count,
+        };
 
-        info!("Found {} objects in bucket {}", objects.len(), bucket);
-        Ok(objects)
+        info!(
+            "Found {} objects in bucket {} (is_truncated: {})",
+            page.objects.len(), bucket, page.is_truncated
+        );
+        Ok(page)
     }
 
     #[instrument(skip(self), fields(bucket = %bucket, key = %key))]

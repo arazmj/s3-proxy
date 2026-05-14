@@ -7,12 +7,13 @@ use axum::{
     Router,
 };
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use aws_sdk_s3::primitives::ByteStream;
 use tracing::{info, instrument};
 
 use crate::config::Config;
-use crate::s3::S3Client;
+use crate::s3::{ListObjectsParams, S3Client};
 use crate::error::{AppError, Result};
 use crate::auth::{AuthState, auth_middleware, check_bucket_access, check_write_permission};
 
@@ -138,6 +139,67 @@ fn format_xml_content(objects: &[aws_sdk_s3::types::Object]) -> String {
         .join("\n")
 }
 
+struct ListObjectsResponseView<'a> {
+    bucket: &'a str,
+    prefix: Option<&'a str>,
+    start_after: Option<&'a str>,
+    max_keys: i32,
+    objects: &'a [aws_sdk_s3::types::Object],
+    is_truncated: bool,
+    next_continuation_token: Option<&'a str>,
+    key_count: i32,
+}
+
+fn parse_list_objects_params(params: &HashMap<String, String>) -> Result<ListObjectsParams> {
+    let max_keys = match params.get("max-keys") {
+        Some(value) => {
+            let parsed = i32::from_str(value)
+                .map_err(|_| AppError::InvalidRequest("max-keys must be an integer".to_string()))?;
+            if parsed < 1 {
+                return Err(AppError::InvalidRequest("max-keys must be at least 1".to_string()));
+            }
+            parsed.min(1000)
+        }
+        None => 1000,
+    };
+
+    Ok(ListObjectsParams {
+        prefix: params.get("prefix").cloned(),
+        start_after: params.get("start-after").cloned(),
+        continuation_token: params.get("continuation-token").cloned(),
+        max_keys,
+    })
+}
+
+fn format_list_objects_xml(view: &ListObjectsResponseView<'_>) -> String {
+    let start_after = view.start_after.map(|value| {
+        format!("    <StartAfter>{}</StartAfter>\n", escape_xml(value))
+    }).unwrap_or_default();
+    let next_continuation_token = view.next_continuation_token.map(|value| {
+        format!("    <NextContinuationToken>{}</NextContinuationToken>\n", escape_xml(value))
+    }).unwrap_or_default();
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>{name}</Name>
+    <Prefix>{prefix}</Prefix>
+{start_after}    <KeyCount>{key_count}</KeyCount>
+    <MaxKeys>{max_keys}</MaxKeys>
+    <IsTruncated>{is_truncated}</IsTruncated>
+{next_continuation_token}{contents}
+</ListBucketResult>"#,
+        name = escape_xml(view.bucket),
+        prefix = escape_xml(view.prefix.unwrap_or_default()),
+        start_after = start_after,
+        key_count = view.key_count,
+        max_keys = view.max_keys,
+        is_truncated = view.is_truncated,
+        next_continuation_token = next_continuation_token,
+        contents = format_xml_content(view.objects),
+    )
+}
+
 #[axum::debug_handler]
 #[instrument(skip(state), fields(bucket = %bucket))]
 async fn list_objects(
@@ -152,25 +214,22 @@ async fn list_objects(
     check_bucket_access(&state.config, &auth.username, &bucket)?;
     
     let (_, client) = state.get_account_and_client(&bucket)?;
-    let prefix = params.get("prefix").cloned();
-    let objects = client.list_objects(&bucket, prefix.clone()).await?;
+    let list_params = parse_list_objects_params(&params)?;
+    let max_keys = list_params.max_keys;
+    let prefix = list_params.prefix.clone();
+    let start_after = list_params.start_after.clone();
+    let page = client.list_objects(&bucket, list_params).await?;
 
-    let key_count = objects.len();
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>{name}</Name>
-    <Prefix>{prefix}</Prefix>
-    <KeyCount>{key_count}</KeyCount>
-    <MaxKeys>{key_count}</MaxKeys>
-    <IsTruncated>false</IsTruncated>
-{contents}
-</ListBucketResult>"#,
-        name = escape_xml(&bucket),
-        prefix = escape_xml(&prefix.unwrap_or_default()),
-        key_count = key_count,
-        contents = format_xml_content(&objects),
-    );
+    let xml = format_list_objects_xml(&ListObjectsResponseView {
+        bucket: &bucket,
+        prefix: prefix.as_deref(),
+        start_after: start_after.as_deref(),
+        max_keys,
+        objects: &page.objects,
+        is_truncated: page.is_truncated,
+        next_continuation_token: page.next_continuation_token.as_deref(),
+        key_count: page.key_count,
+    });
 
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "application/xml".parse().unwrap());
@@ -199,5 +258,65 @@ mod tests {
     fn escape_xml_does_not_double_escape() {
         // Each special char should produce exactly one entity.
         assert_eq!(escape_xml("&amp;"), "&amp;amp;");
+    }
+
+    #[test]
+    fn max_keys_zero_returns_invalid_request() {
+        let params = HashMap::from([("max-keys".to_string(), "0".to_string())]);
+        let err = parse_list_objects_params(&params).unwrap_err();
+        assert!(err.to_string().contains("Invalid request"));
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn list_objects_xml_includes_next_continuation_token_when_present() {
+        let xml = format_list_objects_xml(&ListObjectsResponseView {
+            bucket: "bucket",
+            prefix: None,
+            start_after: None,
+            max_keys: 1000,
+            objects: &[],
+            is_truncated: true,
+            next_continuation_token: Some("next&token"),
+            key_count: 0,
+        });
+
+        assert!(xml.contains("<NextContinuationToken>next&amp;token</NextContinuationToken>"));
+    }
+
+    #[test]
+    fn list_objects_xml_omits_next_continuation_token_when_absent() {
+        let xml = format_list_objects_xml(&ListObjectsResponseView {
+            bucket: "bucket",
+            prefix: None,
+            start_after: None,
+            max_keys: 1000,
+            objects: &[],
+            is_truncated: false,
+            next_continuation_token: None,
+            key_count: 0,
+        });
+
+        assert!(!xml.contains("NextContinuationToken"));
+    }
+
+    #[test]
+    fn list_objects_xml_renders_max_keys_and_key_count_separately() {
+        let xml = format_list_objects_xml(&ListObjectsResponseView {
+            bucket: "bucket",
+            prefix: None,
+            start_after: Some("after<key"),
+            max_keys: 1000,
+            objects: &[],
+            is_truncated: false,
+            next_continuation_token: None,
+            key_count: 2,
+        });
+
+        assert!(xml.contains("<MaxKeys>1000</MaxKeys>"));
+        assert!(xml.contains("<KeyCount>2</KeyCount>"));
+        assert!(xml.contains("<StartAfter>after&lt;key</StartAfter>"));
     }
 }
