@@ -1,20 +1,70 @@
+use aws_sdk_s3::primitives::ByteStream;
 use axum::{
-    body::Bytes,
-    extract::{Path, Query, State, Extension},
+    body::{Body, Bytes},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, put},
     Router,
 };
+use futures::TryStream;
+use http_body::Frame;
+use pin_project_lite::pin_project;
 use std::collections::HashMap;
+use std::error::Error as StdError;
+use std::pin::Pin;
 use std::sync::Arc;
-use aws_sdk_s3::primitives::ByteStream;
+use std::task::{Context, Poll};
+use sync_wrapper::SyncWrapper;
 use tracing::{info, instrument};
 
+use crate::auth::{auth_middleware, check_bucket_access, check_write_permission, AuthState};
 use crate::config::Config;
-use crate::s3::S3Client;
 use crate::error::{AppError, Result};
-use crate::auth::{AuthState, auth_middleware, check_bucket_access, check_write_permission};
+use crate::s3::S3Client;
+
+type BoxError = Box<dyn StdError + Send + Sync>;
+
+pin_project! {
+    struct SyncStreamBody<S> {
+        #[pin]
+        stream: SyncWrapper<S>,
+    }
+}
+
+impl<S> SyncStreamBody<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream: SyncWrapper::new(stream),
+        }
+    }
+}
+
+impl<S, E> http_body::Body for SyncStreamBody<S>
+where
+    S: TryStream<Error = E>,
+    S::Ok: Into<Bytes>,
+    E: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let stream = self.project().stream.get_pin_mut();
+        match futures::ready!(stream.try_poll_next(cx)) {
+            Some(Ok(chunk)) => Poll::Ready(Some(Ok(Frame::data(chunk.into())))),
+            Some(Err(err)) => Poll::Ready(Some(Err(err.into()))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+fn byte_stream_from_body(body: Body) -> ByteStream {
+    ByteStream::from_body_1_x(SyncStreamBody::new(body.into_data_stream()))
+}
 
 pub struct AppState {
     pub config: Arc<Config>,
@@ -23,11 +73,13 @@ pub struct AppState {
 
 impl AppState {
     fn get_account_and_client(&self, bucket: &str) -> Result<(&str, &Arc<S3Client>)> {
-        let (account_id, _account_config) = self.config
+        let (account_id, _account_config) = self
+            .config
             .find_account_for_bucket(bucket)
             .ok_or_else(|| AppError::BucketNotFound(bucket.to_string()))?;
 
-        let client = self.clients
+        let client = self
+            .clients
             .get(account_id)
             .ok_or_else(|| AppError::InternalError("S3 client not found".to_string()))?;
 
@@ -55,17 +107,21 @@ async fn get_object(
     Path((bucket, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse> {
     info!("Getting object {}/{}", bucket, key);
-    
+
     // Check bucket access
     check_bucket_access(&state.config, &auth.username, &bucket)?;
-    
+
     let (_, client) = state.get_account_and_client(&bucket)?;
     let body = client.get_object(&bucket, &key).await?;
-    let bytes = body.collect().await.map_err(|e| AppError::InternalError(e.to_string()))?.to_vec();
-    
+    let bytes = body
+        .collect()
+        .await
+        .map_err(|e| AppError::InternalError(e.to_string()))?
+        .to_vec();
+
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "application/octet-stream".parse().unwrap());
-    
+
     Ok((StatusCode::OK, headers, bytes))
 }
 
@@ -76,14 +132,14 @@ async fn put_object(
     Extension(auth): Extension<AuthState>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<impl IntoResponse> {
     info!("Putting object {}/{}", bucket, key);
-    
+
     // Check bucket access and write permission
     check_bucket_access(&state.config, &auth.username, &bucket)?;
     check_write_permission(&state.config, &auth.username)?;
-    
+
     let (_, client) = state.get_account_and_client(&bucket)?;
 
     let content_type = headers
@@ -91,8 +147,8 @@ async fn put_object(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    let body = ByteStream::from(body);
-    
+    let body = byte_stream_from_body(body);
+
     client.put_object(&bucket, &key, body, content_type).await?;
     Ok(StatusCode::OK)
 }
@@ -147,10 +203,10 @@ async fn list_objects(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse> {
     info!("Listing objects in bucket {}", bucket);
-    
+
     // Check bucket access
     check_bucket_access(&state.config, &auth.username, &bucket)?;
-    
+
     let (_, client) = state.get_account_and_client(&bucket)?;
     let prefix = params.get("prefix").cloned();
     let objects = client.list_objects(&bucket, prefix.clone()).await?;
@@ -182,6 +238,22 @@ async fn list_objects(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn byte_stream_from_body_preserves_streamed_chunks() {
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"stream")),
+        ]));
+
+        let bytes = byte_stream_from_body(body)
+            .collect()
+            .await
+            .expect("stream should collect")
+            .into_bytes();
+
+        assert_eq!(bytes, Bytes::from_static(b"hello stream"));
+    }
+
     #[test]
     fn escape_xml_handles_all_special_chars() {
         assert_eq!(
@@ -192,7 +264,10 @@ mod tests {
 
     #[test]
     fn escape_xml_passes_through_safe_text() {
-        assert_eq!(escape_xml("plain/path/to/file.txt"), "plain/path/to/file.txt");
+        assert_eq!(
+            escape_xml("plain/path/to/file.txt"),
+            "plain/path/to/file.txt"
+        );
     }
 
     #[test]
