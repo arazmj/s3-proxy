@@ -203,4 +203,20 @@ impl S3Client {
         info!("Successfully put object {}/{}", bucket, key);
         Ok(())
     }
+
+    #[instrument(skip(self), fields(bucket = %bucket, key = %key))]
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        info!("Deleting object {}/{}", bucket, key);
+
+        self.client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(aws_sdk_s3::Error::from)?;
+
+        info!("Successfully deleted object {}/{}", bucket, key);
+        Ok(())
+    }
 }

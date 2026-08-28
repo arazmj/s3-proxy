@@ -42,6 +42,9 @@ pub enum AppError {
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
@@ -121,6 +124,7 @@ impl IntoResponse for AppError {
 
             // Authentication and authorization errors
             AppError::Unauthorized(e) => (StatusCode::UNAUTHORIZED, e),
+            AppError::Forbidden(e) => (StatusCode::FORBIDDEN, e),
             AppError::InvalidRequest(e) => (StatusCode::BAD_REQUEST, e),
             AppError::RateLimited(e) => (StatusCode::TOO_MANY_REQUESTS, e),
             AppError::RangeNotSatisfiable => (
@@ -199,5 +203,13 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(json["status"], 401);
         assert_eq!(json["error"], "nope");
+    }
+
+    #[tokio::test]
+    async fn forbidden_status_is_403() {
+        let error = AppError::Forbidden("nope".to_string());
+        let (status, json) = body_to_json(error.into_response()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(json["status"], 403);
     }
 }

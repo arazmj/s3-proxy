@@ -159,7 +159,10 @@ pub async fn create_router(state: AppState) -> Router {
     Router::new()
         .route(
             "/:bucket/*key",
-            get(get_object).put(put_object).head(head_object),
+            get(get_object)
+                .put(put_object)
+                .head(head_object)
+                .delete(delete_object),
         )
         .route("/:bucket", get(list_objects))
         .layer(axum::middleware::from_fn_with_state(
@@ -402,6 +405,24 @@ async fn put_object(
     }
     result?;
     Ok(StatusCode::OK)
+}
+
+#[axum::debug_handler]
+#[instrument(skip(state), fields(bucket = %bucket, key = %key))]
+async fn delete_object(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthState>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Result<impl IntoResponse> {
+    info!("Deleting object {}/{}", bucket, key);
+
+    check_bucket_access(&state.config, &auth.username, &bucket)?;
+    check_write_permission(&state.config, &auth.username)?;
+
+    let (_, client) = state.get_account_and_client(&bucket)?;
+    client.delete_object(&bucket, &key).await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn escape_xml(value: &str) -> String {

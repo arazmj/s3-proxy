@@ -112,6 +112,7 @@ The `x-api-key` header is automatically redacted from request logs.
 | GET    | `/{bucket}/{key}`     | Stream an object. Supports single `Range: bytes=…` requests. |
 | HEAD   | `/{bucket}/{key}`     | Return object metadata without downloading the object.      |
 | PUT    | `/{bucket}/{key}`     | Upload an object. Body is forwarded verbatim.                |
+| DELETE | `/{bucket}/{key}`     | Delete an object (writers only).                             |
 
 All requests must include `x-api-key: <value>`; otherwise the proxy responds
 with `401 Unauthorized`.
@@ -122,7 +123,8 @@ with `401 Unauthorized`.
 |-----:|---------------------------------------------------------------|
 |  200 | Success.                                                      |
 |  400 | Malformed path (e.g. `..`, `//`, trailing `/`).                 |
-|  401 | Missing/invalid API key, bucket not in user's allow-list, or  `readonly` user attempted PUT. |
+|  401 | Missing/invalid API key or bucket not in user's allow-list.    |
+|  403 | Authenticated user lacks write permission.                     |
 |  413 | Upload exceeds `max_file_size`.                               |
 |  429 | Per-user request limit exceeded.                              |
 |  404 | Bucket or object not found.                                   |
