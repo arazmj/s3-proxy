@@ -69,6 +69,24 @@ fn rate_limiter() -> &'static Mutex<RateLimiter> {
     INSTANCE.get_or_init(|| Mutex::new(RateLimiter::new()))
 }
 
+fn add_secure_headers(headers: &mut http::HeaderMap) {
+    headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    headers.insert(
+        "Strict-Transport-Security",
+        "max-age=63072000; includeSubDomains; preload"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        "Content-Security-Policy",
+        "default-src 'none'; frame-ancestors 'none'"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert("Referrer-Policy", "no-referrer".parse().unwrap());
+}
+
 fn validate_request(config: &Config, request: &Request) -> Result<()> {
     // Check content length for PUT requests
     if request.method() == http::Method::PUT {
@@ -216,6 +234,18 @@ mod tests {
         assert!(validate_request(&cfg, &req(http::Method::GET, "/bucket/../etc/passwd")).is_err());
     }
 
+    #[test]
+    fn secure_headers_exclude_deprecated_xss_protection() {
+        let mut headers = http::HeaderMap::new();
+
+        add_secure_headers(&mut headers);
+
+        assert!(headers.get("X-XSS-Protection").is_none());
+        assert_eq!(headers.get("X-Content-Type-Options").unwrap(), "nosniff");
+        assert!(headers.get("Strict-Transport-Security").is_some());
+        assert!(headers.get("Content-Security-Policy").is_some());
+    }
+
     // Suppress unused-import warnings for items only used in non-test code.
     #[allow(dead_code)]
     fn _unused_imports_marker() {
@@ -354,15 +384,7 @@ pub async fn auth_middleware(
     // Process the request
     let mut response = next.run(request).await;
 
-    // Add secure headers
-    let headers = response.headers_mut();
-    headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
-    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
-    headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
-    headers.insert(
-        "Strict-Transport-Security",
-        "max-age=31536000; includeSubDomains".parse().unwrap(),
-    );
+    add_secure_headers(response.headers_mut());
 
     info!(
         "Authenticated user: {} with role: {:?}",
