@@ -27,6 +27,33 @@ fn redact_sensitive_data(headers: &http::HeaderMap) -> String {
     redacted
 }
 
+/// Waits for Ctrl-C on all platforms or SIGTERM on Unix, then logs before graceful draining.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("received shutdown signal, draining in-flight requests...");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing with custom format
@@ -98,6 +125,7 @@ async fn main() -> Result<()> {
         .map_err(|e| AppError::InternalError(format!("Failed to bind to {addr}: {e}")))?;
 
     axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| AppError::InternalError(format!("Server error: {e}")))?;
 
