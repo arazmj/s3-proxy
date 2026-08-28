@@ -113,6 +113,8 @@ The `x-api-key` header is automatically redacted from request logs.
 | HEAD   | `/{bucket}/{key}`     | Return object metadata without downloading the object.      |
 | PUT    | `/{bucket}/{key}`     | Upload an object. Body is forwarded verbatim.                |
 | DELETE | `/{bucket}/{key}`     | Delete an object (writers only).                             |
+| GET    | `/livez`              | Unauthenticated process liveness check.                     |
+| GET    | `/readyz`             | Unauthenticated configuration/client readiness check.       |
 
 All requests must include `x-api-key: <value>`; otherwise the proxy responds
 with `401 Unauthorized`.
@@ -127,6 +129,7 @@ with `401 Unauthorized`.
 |  403 | Authenticated user lacks write permission.                     |
 |  413 | Upload exceeds `max_file_size`.                               |
 |  429 | Per-user request limit exceeded.                              |
+|  503 | Readiness checks fail until backend clients are initialized.  |
 |  404 | Bucket or object not found.                                   |
 |  500 | Internal / upstream S3 error.                                 |
 

@@ -156,7 +156,9 @@ impl AppState {
 }
 
 pub async fn create_router(state: AppState) -> Router {
-    Router::new()
+    let state = Arc::new(state);
+
+    let authenticated = Router::new()
         .route(
             "/:bucket/*key",
             get(get_object)
@@ -169,7 +171,47 @@ pub async fn create_router(state: AppState) -> Router {
             state.config.clone(),
             auth_middleware,
         ))
-        .with_state(Arc::new(state))
+        .with_state(state.clone());
+
+    let health = Router::new()
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
+        .with_state(state);
+
+    authenticated.merge(health)
+}
+
+fn health_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers
+}
+
+async fn livez() -> impl IntoResponse {
+    (StatusCode::OK, health_headers(), r#"{"status":"ok"}"#)
+}
+
+async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let ready = !state.config.accounts.is_empty()
+        && state
+            .config
+            .accounts
+            .keys()
+            .all(|account_id| state.clients.contains_key(account_id));
+
+    if ready {
+        (StatusCode::OK, health_headers(), r#"{"status":"ready"}"#)
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            health_headers(),
+            r#"{"status":"not_ready"}"#,
+        )
+    }
 }
 
 fn parse_range_header(value: &str) -> Result<String> {
@@ -578,6 +620,8 @@ async fn list_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::to_bytes, http::Request};
+    use tower::Service;
 
     fn list_view<'a>() -> ListObjectsResponseView<'a> {
         ListObjectsResponseView {
@@ -635,6 +679,62 @@ mod tests {
         .await;
 
         assert!(router.has_routes());
+    }
+
+    fn health_test_state(has_account: bool) -> AppState {
+        let accounts = if has_account {
+            r#"{
+                "account-a": {
+                    "endpoint_url": "http://localhost:9000",
+                    "region": "us-east-1",
+                    "access_key_id": "access-key",
+                    "secret_access_key": "secret-key",
+                    "buckets": ["bucket-a"]
+                }
+            }"#
+        } else {
+            "{}"
+        };
+        let config = serde_json::from_str(&format!(
+            r#"{{
+                "accounts": {accounts},
+                "users": {{}},
+                "server": {{ "host": "127.0.0.1", "port": 8080 }}
+            }}"#
+        ))
+        .unwrap();
+
+        AppState {
+            config: Arc::new(config),
+            clients: HashMap::new(),
+        }
+    }
+
+    async fn health_get(path: &str, has_account: bool) -> axum::response::Response {
+        let mut router = create_router(health_test_state(has_account)).await;
+        router
+            .call(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn livez_is_unauthenticated_and_not_cached() {
+        let response = health_get("/livez", true).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], br#"{"status":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn readyz_requires_initialized_account_clients() {
+        let no_accounts = health_get("/readyz", false).await;
+        assert_eq!(no_accounts.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let missing_client = health_get("/readyz", true).await;
+        assert_eq!(missing_client.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
