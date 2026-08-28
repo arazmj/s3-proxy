@@ -24,12 +24,6 @@ struct RateLimiter {
 }
 
 impl RateLimiter {
-    fn new() -> Self {
-        Self {
-            requests: HashMap::new(),
-        }
-    }
-
     fn is_rate_limited(&mut self, username: &str) -> bool {
         let now = Instant::now();
         let window = Duration::from_secs(60); // 1 minute window
@@ -52,7 +46,7 @@ impl RateLimiter {
 }
 
 lazy_static::lazy_static! {
-    static ref RATE_LIMITER: RwLock<RateLimiter> = RwLock::new(RateLimiter::new());
+    static ref RATE_LIMITER: RwLock<RateLimiter> = RwLock::new(RateLimiter::default());
 }
 
 fn validate_request(config: &Config, request: &Request) -> Result<()> {
