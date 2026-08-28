@@ -1,18 +1,18 @@
+mod auth;
 mod config;
+mod error;
+mod metrics;
 mod s3;
 mod server;
-mod error;
-mod auth;
-mod metrics;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use tracing::{info, Level};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use tower_http::trace::{TraceLayer, DefaultMakeSpan, DefaultOnResponse};
-use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
 use axum::extract::Request;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::{info, Level};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::error::{AppError, Result};
 
@@ -24,9 +24,36 @@ fn redact_sensitive_data(headers: &http::HeaderMap) -> String {
         } else {
             value.to_str().unwrap_or("***INVALID***")
         };
-        redacted.push_str(&format!("{}: {}\n", name, value));
+        redacted.push_str(&format!("{name}: {value}\n"));
     }
     redacted
+}
+
+/// Waits for Ctrl-C on all platforms or SIGTERM on Unix, then logs before graceful draining.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("received shutdown signal, draining in-flight requests...");
 }
 
 #[tokio::main]
@@ -51,11 +78,14 @@ async fn main() -> Result<()> {
 
     let prometheus_handle = PrometheusBuilder::new()
         .install_recorder()
-        .map_err(|e| AppError::InternalError(format!("Failed to install Prometheus recorder: {}", e)))?;
+        .map_err(|error| {
+            AppError::InternalError(format!("Failed to install Prometheus recorder: {error}"))
+        })?;
 
     // Load configuration
     let config = Arc::new(config::Config::load("config.json")?);
-    info!("Loaded configuration with {} accounts and {} users", 
+    info!(
+        "Loaded configuration with {} accounts and {} users",
         config.accounts.len(),
         config.users.len()
     );
@@ -69,7 +99,8 @@ async fn main() -> Result<()> {
             account_config.region.clone(),
             account_config.access_key_id.clone(),
             account_config.secret_access_key.clone(),
-        ).await?;
+        )
+        .await?;
         clients.insert(account_id.clone(), Arc::new(client));
     }
 
@@ -78,7 +109,8 @@ async fn main() -> Result<()> {
         config: config.clone(),
         clients,
         prometheus_handle,
-    }).await
+    })
+    .await
     .layer(
         TraceLayer::new(SharedClassifier::new(ServerErrorsAsFailures::new()))
             .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
@@ -90,20 +122,21 @@ async fn main() -> Result<()> {
                     headers = %redact_sensitive_data(request.headers()),
                     "Request started"
                 );
-            })
+            }),
     );
 
     // Start server
     let addr = format!("{}:{}", config.server.host, config.server.port);
     info!("Starting server on {}", addr);
-    
+
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .map_err(|e| AppError::InternalError(format!("Failed to bind to {}: {}", addr, e)))?;
-    
+        .map_err(|e| AppError::InternalError(format!("Failed to bind to {addr}: {e}")))?;
+
     axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(|e| AppError::InternalError(format!("Server error: {}", e)))?;
+        .map_err(|e| AppError::InternalError(format!("Server error: {e}")))?;
 
     Ok(())
-} 
+}

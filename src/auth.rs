@@ -1,18 +1,13 @@
 use axum::{
-    extract::Request,
-    http::header,
-    middleware::Next,
+    extract::Request, extract::State, http::header, middleware::Next, response::IntoResponse,
     response::Response,
-    extract::State,
-    response::IntoResponse,
 };
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use std::collections::HashMap;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, RateLimitConfig};
 use crate::error::{AppError, Result};
 
 #[derive(Debug, Clone)]
@@ -34,49 +29,82 @@ impl RateLimiter {
         }
     }
 
-    fn is_rate_limited(&mut self, username: &str) -> bool {
+    /// Returns `true` when `username` has already made `cfg.max_requests`
+    /// requests within the trailing `cfg.window_secs` seconds.
+    ///
+    /// A `max_requests` of `0` disables the limiter entirely.
+    fn is_rate_limited(&mut self, username: &str, cfg: RateLimitConfig) -> bool {
+        if cfg.max_requests == 0 {
+            return false;
+        }
+
         let now = Instant::now();
-        let window = Duration::from_secs(60); // 1 minute window
-        let max_requests = 100; // max requests per minute
+        let window = Duration::from_secs(cfg.window_secs);
+        let max_requests = cfg.max_requests as usize;
+
+        // Clean up users whose entire window has expired so the map doesn't
+        // accumulate stale `Vec<Instant>` allocations for one-shot callers.
+        self.requests
+            .retain(|_, times| times.iter().any(|&t| now.duration_since(t) < window));
 
         let requests = self.requests.entry(username.to_string()).or_default();
-        
-        // Remove old requests
         requests.retain(|&time| now.duration_since(time) < window);
-        
-        // Check if rate limited
+
         if requests.len() >= max_requests {
             return true;
         }
-        
-        // Add new request
+
         requests.push(now);
         false
     }
 }
 
-lazy_static::lazy_static! {
-    static ref RATE_LIMITER: RwLock<RateLimiter> = RwLock::new(RateLimiter::new());
+// Global rate-limiter state. A `std::sync::Mutex` is fine here because the
+// critical section is short, synchronous, and never `.await`s — using
+// `tokio::sync::RwLock` (which we did before) was misleading since every call
+// took the write lock anyway.
+fn rate_limiter() -> &'static Mutex<RateLimiter> {
+    use std::sync::OnceLock;
+    static INSTANCE: OnceLock<Mutex<RateLimiter>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(RateLimiter::new()))
+}
+
+fn add_secure_headers(headers: &mut http::HeaderMap) {
+    headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    headers.insert(
+        "Strict-Transport-Security",
+        "max-age=63072000; includeSubDomains; preload"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        "Content-Security-Policy",
+        "default-src 'none'; frame-ancestors 'none'"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert("Referrer-Policy", "no-referrer".parse().unwrap());
+}
+
+pub async fn security_headers_middleware(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    add_secure_headers(response.headers_mut());
+    response
+}
+
+fn requires_write_permission(method: &http::Method) -> bool {
+    matches!(*method, http::Method::PUT | http::Method::DELETE)
 }
 
 fn validate_request(config: &Config, request: &Request) -> Result<()> {
     // Check content length for PUT requests
     if request.method() == http::Method::PUT {
-        // Check write permissions
-        if let Some(api_key) = request.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
-            if let Some((username, _)) = config.find_user_by_api_key(api_key) {
-                check_write_permission(config, &username)?;
-            }
-        }
-
         if let Some(content_length) = request.headers().get(header::CONTENT_LENGTH) {
             if let Ok(s) = content_length.to_str() {
                 if let Ok(length) = s.parse::<u64>() {
                     if length > config.max_file_size {
-                        return Err(AppError::InvalidRequest(format!(
-                            "File size {} exceeds maximum allowed size of {} bytes",
-                            length, config.max_file_size
-                        )));
+                        return Err(AppError::PayloadTooLarge(config.max_file_size));
                     }
                 }
             }
@@ -115,6 +143,7 @@ fn validate_request(config: &Config, request: &Request) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use axum::body::Body;
@@ -132,6 +161,13 @@ mod tests {
         // Sanity: defaults applied.
         let _ = cfg.max_file_size;
         cfg
+    }
+
+    fn rate_cfg(max_requests: u32, window_secs: u64) -> RateLimitConfig {
+        RateLimitConfig {
+            max_requests,
+            window_secs,
+        }
     }
 
     fn req(method: http::Method, path: &str) -> Request {
@@ -162,7 +198,10 @@ mod tests {
         let cfg = make_config();
         validate_request(
             &cfg,
-            &req(http::Method::GET, "/mybucket/path/to/deeply/nested/file.txt"),
+            &req(
+                http::Method::GET,
+                "/mybucket/path/to/deeply/nested/file.txt",
+            ),
         )
         .expect("nested object keys must be allowed");
     }
@@ -191,10 +230,110 @@ mod tests {
         assert!(validate_request(&cfg, &req(http::Method::GET, "/bucket/../etc/passwd")).is_err());
     }
 
+    #[test]
+    fn secure_headers_exclude_deprecated_xss_protection() {
+        let mut headers = http::HeaderMap::new();
+
+        add_secure_headers(&mut headers);
+
+        assert!(headers.get("X-XSS-Protection").is_none());
+        assert_eq!(headers.get("X-Content-Type-Options").unwrap(), "nosniff");
+        assert!(headers.get("Strict-Transport-Security").is_some());
+        assert!(headers.get("Content-Security-Policy").is_some());
+    }
+
+    #[test]
+    fn write_methods_require_write_permission() {
+        assert!(requires_write_permission(&http::Method::PUT));
+        assert!(requires_write_permission(&http::Method::DELETE));
+        assert!(!requires_write_permission(&http::Method::GET));
+        assert!(!requires_write_permission(&http::Method::HEAD));
+    }
+
     // Suppress unused-import warnings for items only used in non-test code.
     #[allow(dead_code)]
     fn _unused_imports_marker() {
         let _ = HashMap::<String, String>::new();
+    }
+
+    #[test]
+    fn rate_limiter_allows_under_limit() {
+        let mut rl = RateLimiter::new();
+        let cfg = rate_cfg(3, 60);
+        for _ in 0..3 {
+            assert!(!rl.is_rate_limited("alice", cfg));
+        }
+    }
+
+    #[test]
+    fn rate_limiter_blocks_at_limit() {
+        let mut rl = RateLimiter::new();
+        let cfg = rate_cfg(2, 60);
+        assert!(!rl.is_rate_limited("alice", cfg));
+        assert!(!rl.is_rate_limited("alice", cfg));
+        // 3rd request in the window must be rejected.
+        assert!(rl.is_rate_limited("alice", cfg));
+        // Successive checks while still over the limit also fail and do NOT
+        // accumulate further timestamps for the user.
+        assert!(rl.is_rate_limited("alice", cfg));
+    }
+
+    #[test]
+    fn rate_limiter_isolates_users() {
+        let mut rl = RateLimiter::new();
+        let cfg = rate_cfg(1, 60);
+        assert!(!rl.is_rate_limited("alice", cfg));
+        assert!(rl.is_rate_limited("alice", cfg));
+        // Bob has his own bucket and is unaffected by Alice's traffic.
+        assert!(!rl.is_rate_limited("bob", cfg));
+    }
+
+    #[test]
+    fn rate_limiter_recovers_after_window() {
+        let mut rl = RateLimiter::new();
+        // 1-request-per-1-second window.
+        let cfg = rate_cfg(1, 1);
+        assert!(!rl.is_rate_limited("alice", cfg));
+        assert!(rl.is_rate_limited("alice", cfg));
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            !rl.is_rate_limited("alice", cfg),
+            "request after the window elapses must be allowed"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_zero_max_disables_limit() {
+        let mut rl = RateLimiter::new();
+        let cfg = rate_cfg(0, 60);
+        for _ in 0..1_000 {
+            assert!(!rl.is_rate_limited("alice", cfg));
+        }
+        // And no state should be retained for the user when the limiter is
+        // disabled — saves memory and avoids surprising side-effects.
+        assert!(rl.requests.is_empty());
+    }
+
+    #[test]
+    fn rate_limiter_reclaims_idle_users() {
+        // Per-user `Vec<Instant>` allocations should not pile up forever for
+        // callers that go silent: once their entire window has expired, the
+        // map entry is removed on the next call by any user.
+        let mut rl = RateLimiter::new();
+        let cfg = rate_cfg(5, 1);
+        for _ in 0..3 {
+            assert!(!rl.is_rate_limited("alice", cfg));
+        }
+        assert_eq!(rl.requests.len(), 1);
+        std::thread::sleep(Duration::from_millis(1100));
+
+        // A request from a different user should evict alice's stale entry.
+        assert!(!rl.is_rate_limited("bob", cfg));
+        assert!(
+            !rl.requests.contains_key("alice"),
+            "stale entry for alice must be reclaimed; map = {:?}",
+            rl.requests.keys().collect::<Vec<_>>()
+        );
     }
 }
 
@@ -212,7 +351,8 @@ pub async fn auth_middleware(
     let api_key = match request
         .headers()
         .get("x-api-key")
-        .and_then(|v| v.to_str().ok()) {
+        .and_then(|v| v.to_str().ok())
+    {
         Some(key) => key,
         None => {
             warn!("No API key provided");
@@ -229,10 +369,20 @@ pub async fn auth_middleware(
         }
     };
 
+    if requires_write_permission(request.method()) {
+        if let Err(error) = check_write_permission(&config, username) {
+            return error.into_response();
+        }
+    }
+
     // Check rate limit
-    if RATE_LIMITER.write().await.is_rate_limited(&username) {
+    let limited = {
+        let mut limiter = rate_limiter().lock().expect("rate limiter mutex poisoned");
+        limiter.is_rate_limited(username, config.rate_limit)
+    };
+    if limited {
         warn!("Rate limit exceeded for user {}", username);
-        return AppError::Unauthorized("Rate limit exceeded".to_string()).into_response();
+        return AppError::RateLimited("Rate limit exceeded".to_string()).into_response();
     }
 
     // Add auth state to request extensions
@@ -241,17 +391,12 @@ pub async fn auth_middleware(
         role: format!("{:?}", user.role),
     });
 
-    // Process the request
-    let mut response = next.run(request).await;
+    let response = next.run(request).await;
 
-    // Add secure headers
-    let headers = response.headers_mut();
-    headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
-    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
-    headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
-    headers.insert("Strict-Transport-Security", "max-age=31536000; includeSubDomains".parse().unwrap());
-
-    info!("Authenticated user: {} with role: {:?}", username, user.role);
+    info!(
+        "Authenticated user: {} with role: {:?}",
+        username, user.role
+    );
     response
 }
 
@@ -269,7 +414,7 @@ pub fn check_bucket_access(config: &Config, username: &str, bucket: &str) -> Res
 pub fn check_write_permission(config: &Config, username: &str) -> Result<()> {
     if !config.can_write(username) {
         warn!("User {} not allowed to write", username);
-        return Err(AppError::Unauthorized("Write permission denied".to_string()));
+        return Err(AppError::Forbidden("Write permission denied".to_string()));
     }
     Ok(())
-} 
+}

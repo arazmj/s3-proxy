@@ -20,6 +20,7 @@ bucket name maps to exactly one configured backend account.
 - Three roles: `admin`, `user`, `readonly`. `admin` and `user` may write;
   `readonly` is GET-only.
 - Per-user sliding-window rate limiting (default 100 req/min).
+- Prometheus request counters and latency histograms at `/metrics`.
 - Configurable max upload size (default 100 MiB).
 - Path-traversal defense in the request validator (`.`, `..`, `//`,
   trailing `/` are rejected).
@@ -71,7 +72,13 @@ The proxy reads `config.json` from the current working directory at startup.
   },
 
   // Optional. Maximum body size accepted on PUT. Default: 104857600 (100 MiB).
-  "max_file_size": 104857600
+  "max_file_size": 104857600,
+
+  // Optional. Per-user sliding-window request limit.
+  "rate_limit": {
+    "max_requests": 100,
+    "window_secs": 60
+  }
 }
 ```
 
@@ -102,9 +109,14 @@ The `x-api-key` header is automatically redacted from request logs.
 
 | Method | Path                  | Description                                                  |
 |--------|-----------------------|--------------------------------------------------------------|
-| GET    | `/{bucket}?prefix=…`  | List objects in `bucket`. Returns S3 `ListBucketResult` XML. |
-| GET    | `/{bucket}/{key}`     | Fetch an object. `{key}` may contain `/`.                    |
+| GET    | `/{bucket}`           | List objects with S3 V2 pagination query parameters.        |
+| GET    | `/{bucket}/{key}`     | Stream an object. Supports single `Range: bytes=…` requests. |
+| HEAD   | `/{bucket}/{key}`     | Return object metadata without downloading the object.      |
 | PUT    | `/{bucket}/{key}`     | Upload an object. Body is forwarded verbatim.                |
+| DELETE | `/{bucket}/{key}`     | Delete an object (writers only).                             |
+| GET    | `/livez`              | Unauthenticated process liveness check.                     |
+| GET    | `/readyz`             | Unauthenticated configuration/client readiness check.       |
+| GET    | `/metrics`            | Unauthenticated Prometheus metrics.                          |
 
 All requests must include `x-api-key: <value>`; otherwise the proxy responds
 with `401 Unauthorized`.
@@ -114,8 +126,12 @@ with `401 Unauthorized`.
 | Code | Meaning                                                       |
 |-----:|---------------------------------------------------------------|
 |  200 | Success.                                                      |
-|  400 | Malformed path (e.g. `..`, `//`, trailing `/`) or oversize body. |
-|  401 | Missing/invalid API key, bucket not in user's allow-list, or  `readonly` user attempted PUT. |
+|  400 | Malformed path (e.g. `..`, `//`, trailing `/`).                 |
+|  401 | Missing/invalid API key or bucket not in user's allow-list.    |
+|  403 | Authenticated user lacks write permission.                     |
+|  413 | Upload exceeds `max_file_size`.                               |
+|  429 | Per-user request limit exceeded.                              |
+|  503 | Readiness checks fail until backend clients are initialized.  |
 |  404 | Bucket or object not found.                                   |
 |  500 | Internal / upstream S3 error.                                 |
 
