@@ -71,7 +71,13 @@ The proxy reads `config.json` from the current working directory at startup.
   },
 
   // Optional. Maximum body size accepted on PUT. Default: 104857600 (100 MiB).
-  "max_file_size": 104857600
+  "max_file_size": 104857600,
+
+  // Optional. Per-user sliding-window request limit.
+  "rate_limit": {
+    "max_requests": 100,
+    "window_secs": 60
+  }
 }
 ```
 
@@ -116,6 +122,7 @@ with `401 Unauthorized`.
 |  200 | Success.                                                      |
 |  400 | Malformed path (e.g. `..`, `//`, trailing `/`) or oversize body. |
 |  401 | Missing/invalid API key, bucket not in user's allow-list, or  `readonly` user attempted PUT. |
+|  429 | Per-user request limit exceeded.                              |
 |  404 | Bucket or object not found.                                   |
 |  500 | Internal / upstream S3 error.                                 |
 

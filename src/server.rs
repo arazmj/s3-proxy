@@ -1,21 +1,21 @@
+use aws_sdk_s3::{operation::get_object::GetObjectOutput, primitives::ByteStream};
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, Query, State, Extension},
+    extract::{Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, put},
     Router,
 };
+use futures::stream;
 use std::collections::HashMap;
 use std::sync::Arc;
-use aws_sdk_s3::{operation::get_object::GetObjectOutput, primitives::ByteStream};
-use futures::stream;
 use tracing::{info, instrument};
 
+use crate::auth::{auth_middleware, check_bucket_access, check_write_permission, AuthState};
 use crate::config::Config;
-use crate::s3::S3Client;
 use crate::error::{AppError, Result};
-use crate::auth::{AuthState, auth_middleware, check_bucket_access, check_write_permission};
+use crate::s3::S3Client;
 
 pub struct AppState {
     pub config: Arc<Config>,
@@ -24,11 +24,13 @@ pub struct AppState {
 
 impl AppState {
     fn get_account_and_client(&self, bucket: &str) -> Result<(&str, &Arc<S3Client>)> {
-        let (account_id, _account_config) = self.config
+        let (account_id, _account_config) = self
+            .config
             .find_account_for_bucket(bucket)
             .ok_or_else(|| AppError::BucketNotFound(bucket.to_string()))?;
 
-        let client = self.clients
+        let client = self
+            .clients
             .get(account_id)
             .ok_or_else(|| AppError::InternalError("S3 client not found".to_string()))?;
 
@@ -56,10 +58,10 @@ async fn get_object(
     Path((bucket, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse> {
     info!("Getting object {}/{}", bucket, key);
-    
+
     // Check bucket access
     check_bucket_access(&state.config, &auth.username, &bucket)?;
-    
+
     let (_, client) = state.get_account_and_client(&bucket)?;
     let response = client.get_object(&bucket, &key).await?;
     let headers = get_object_headers(&response);
@@ -71,7 +73,7 @@ async fn get_object(
         }
     });
     let body = Body::from_stream(body_stream);
-    
+
     Ok((StatusCode::OK, headers, body))
 }
 
@@ -89,7 +91,11 @@ fn get_object_headers(response: &GetObjectOutput) -> HeaderMap {
         insert_header_if_valid(&mut headers, header::CONTENT_TYPE, content_type);
     }
     if let Some(content_length) = response.content_length() {
-        insert_header_if_valid(&mut headers, header::CONTENT_LENGTH, &content_length.to_string());
+        insert_header_if_valid(
+            &mut headers,
+            header::CONTENT_LENGTH,
+            &content_length.to_string(),
+        );
     }
     if let Some(e_tag) = response.e_tag() {
         insert_header_if_valid(&mut headers, header::ETAG, e_tag);
@@ -117,11 +123,11 @@ async fn put_object(
     body: Bytes,
 ) -> Result<impl IntoResponse> {
     info!("Putting object {}/{}", bucket, key);
-    
+
     // Check bucket access and write permission
     check_bucket_access(&state.config, &auth.username, &bucket)?;
     check_write_permission(&state.config, &auth.username)?;
-    
+
     let (_, client) = state.get_account_and_client(&bucket)?;
 
     let content_type = headers
@@ -130,7 +136,7 @@ async fn put_object(
         .map(String::from);
 
     let body = ByteStream::from(body);
-    
+
     client.put_object(&bucket, &key, body, content_type).await?;
     Ok(StatusCode::OK)
 }
@@ -185,10 +191,10 @@ async fn list_objects(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse> {
     info!("Listing objects in bucket {}", bucket);
-    
+
     // Check bucket access
     check_bucket_access(&state.config, &auth.username, &bucket)?;
-    
+
     let (_, client) = state.get_account_and_client(&bucket)?;
     let prefix = params.get("prefix").cloned();
     let objects = client.list_objects(&bucket, prefix.clone()).await?;
@@ -226,7 +232,9 @@ mod tests {
         let headers = get_object_headers(&response);
 
         assert_eq!(
-            headers.get(header::ACCEPT_RANGES).and_then(|value| value.to_str().ok()),
+            headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok()),
             Some("bytes")
         );
     }
@@ -241,7 +249,10 @@ mod tests {
 
     #[test]
     fn escape_xml_passes_through_safe_text() {
-        assert_eq!(escape_xml("plain/path/to/file.txt"), "plain/path/to/file.txt");
+        assert_eq!(
+            escape_xml("plain/path/to/file.txt"),
+            "plain/path/to/file.txt"
+        );
     }
 
     #[test]
