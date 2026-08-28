@@ -47,6 +47,9 @@ pub enum AppError {
 
     #[error("Too many requests: {0}")]
     RateLimited(String),
+
+    #[error("Requested range is not satisfiable")]
+    RangeNotSatisfiable,
 }
 
 impl From<aws_sdk_s3::Error> for AppError {
@@ -117,6 +120,10 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(e) => (StatusCode::UNAUTHORIZED, e),
             AppError::InvalidRequest(e) => (StatusCode::BAD_REQUEST, e),
             AppError::RateLimited(e) => (StatusCode::TOO_MANY_REQUESTS, e),
+            AppError::RangeNotSatisfiable => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "Requested range is not satisfiable".to_string(),
+            ),
         };
 
         let body = ErrorBody {

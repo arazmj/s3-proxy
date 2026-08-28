@@ -109,7 +109,7 @@ The `x-api-key` header is automatically redacted from request logs.
 | Method | Path                  | Description                                                  |
 |--------|-----------------------|--------------------------------------------------------------|
 | GET    | `/{bucket}?prefix=…`  | List objects in `bucket`. Returns S3 `ListBucketResult` XML. |
-| GET    | `/{bucket}/{key}`     | Fetch an object. `{key}` may contain `/`.                    |
+| GET    | `/{bucket}/{key}`     | Stream an object. Supports single `Range: bytes=…` requests. |
 | PUT    | `/{bucket}/{key}`     | Upload an object. Body is forwarded verbatim.                |
 
 All requests must include `x-api-key: <value>`; otherwise the proxy responds

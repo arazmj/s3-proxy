@@ -72,18 +72,21 @@ impl S3Client {
         Ok(objects)
     }
 
-    #[instrument(skip(self), fields(bucket = %bucket, key = %key))]
-    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<GetObjectOutput> {
-        info!("Getting object {}/{}", bucket, key);
+    #[instrument(skip(self), fields(bucket = %bucket, key = %key, range = ?range))]
+    pub async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<String>,
+    ) -> Result<GetObjectOutput> {
+        info!("Getting object {}/{} with range {:?}", bucket, key, range);
 
-        match self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-        {
+        let mut request = self.client.get_object().bucket(bucket).key(key);
+        if let Some(range) = range {
+            request = request.range(range);
+        }
+
+        match request.send().await {
             Ok(response) => Ok(response),
             Err(e) => {
                 if let SdkError::ServiceError(context) = &e {
@@ -92,6 +95,9 @@ impl S3Client {
                             bucket.to_string(),
                             key.to_string(),
                         ));
+                    }
+                    if context.raw().status().as_u16() == 416 {
+                        return Err(AppError::RangeNotSatisfiable);
                     }
                 }
                 Err(e.into())
