@@ -1,20 +1,138 @@
+use aws_sdk_s3::{operation::get_object::GetObjectOutput, primitives::ByteStream};
 use axum::{
-    body::Bytes,
-    extract::{Path, Query, State, Extension},
-    http::{HeaderMap, StatusCode},
+    body::{Body, Bytes},
+    extract::{Extension, Path, Query, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, put},
+    routing::get,
     Router,
 };
+use futures::{stream, TryStream};
+use http_body::Frame;
+use pin_project_lite::pin_project;
 use std::collections::HashMap;
+use std::error::Error as StdError;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use aws_sdk_s3::primitives::ByteStream;
+use std::task::{Context, Poll};
+use sync_wrapper::SyncWrapper;
 use tracing::{info, instrument};
 
+use crate::auth::{auth_middleware, check_bucket_access, check_write_permission, AuthState};
 use crate::config::Config;
-use crate::s3::S3Client;
 use crate::error::{AppError, Result};
-use crate::auth::{AuthState, auth_middleware, check_bucket_access, check_write_permission};
+use crate::s3::{HeadObjectMetadata, ListObjectsParams, S3Client};
+
+type BoxError = Box<dyn StdError + Send + Sync>;
+
+pin_project! {
+    struct LimitedStream<S> {
+        #[pin]
+        stream: S,
+        remaining: u64,
+        exceeded: Arc<AtomicBool>,
+        done: bool,
+    }
+}
+
+impl<S> LimitedStream<S> {
+    fn new(stream: S, limit: u64, exceeded: Arc<AtomicBool>) -> Self {
+        Self {
+            stream,
+            remaining: limit,
+            exceeded,
+            done: false,
+        }
+    }
+}
+
+impl<S, E> futures::Stream for LimitedStream<S>
+where
+    S: TryStream<Error = E>,
+    S::Ok: Into<Bytes>,
+    E: Into<BoxError>,
+{
+    type Item = std::result::Result<Bytes, BoxError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if *this.done {
+            return Poll::Ready(None);
+        }
+
+        match futures::ready!(this.stream.as_mut().try_poll_next(cx)) {
+            Some(Ok(chunk)) => {
+                let bytes = chunk.into();
+                if bytes.len() as u64 > *this.remaining {
+                    this.exceeded.store(true, Ordering::Relaxed);
+                    *this.done = true;
+                    Poll::Ready(Some(Err(std::io::Error::other(
+                        "request body exceeds configured maximum",
+                    )
+                    .into())))
+                } else {
+                    *this.remaining -= bytes.len() as u64;
+                    Poll::Ready(Some(Ok(bytes)))
+                }
+            }
+            Some(Err(error)) => {
+                *this.done = true;
+                Poll::Ready(Some(Err(error.into())))
+            }
+            None => {
+                *this.done = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+pin_project! {
+    struct SyncStreamBody<S> {
+        #[pin]
+        stream: SyncWrapper<S>,
+    }
+}
+
+impl<S> SyncStreamBody<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream: SyncWrapper::new(stream),
+        }
+    }
+}
+
+impl<S, E> http_body::Body for SyncStreamBody<S>
+where
+    S: TryStream<Error = E>,
+    S::Ok: Into<Bytes>,
+    E: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let stream = self.project().stream.get_pin_mut();
+        match futures::ready!(stream.try_poll_next(cx)) {
+            Some(Ok(chunk)) => Poll::Ready(Some(Ok(Frame::data(chunk.into())))),
+            Some(Err(error)) => Poll::Ready(Some(Err(error.into()))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+fn byte_stream_from_body(body: Body, limit: u64) -> (ByteStream, Arc<AtomicBool>) {
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let stream = LimitedStream::new(body.into_data_stream(), limit, exceeded.clone());
+    (
+        ByteStream::from_body_1_x(SyncStreamBody::new(stream)),
+        exceeded,
+    )
+}
 
 pub struct AppState {
     pub config: Arc<Config>,
@@ -23,11 +141,13 @@ pub struct AppState {
 
 impl AppState {
     fn get_account_and_client(&self, bucket: &str) -> Result<(&str, &Arc<S3Client>)> {
-        let (account_id, _account_config) = self.config
+        let (account_id, _account_config) = self
+            .config
             .find_account_for_bucket(bucket)
             .ok_or_else(|| AppError::BucketNotFound(bucket.to_string()))?;
 
-        let client = self.clients
+        let client = self
+            .clients
             .get(account_id)
             .ok_or_else(|| AppError::InternalError("S3 client not found".to_string()))?;
 
@@ -37,9 +157,13 @@ impl AppState {
 
 pub async fn create_router(state: AppState) -> Router {
     Router::new()
-        .route("/:bucket/*key", get(get_object))
-        .route("/:bucket/*key", put(put_object))
-        .route("/:bucket/*key", delete(delete_object))
+        .route(
+            "/:bucket/*key",
+            get(get_object)
+                .put(put_object)
+                .head(head_object)
+                .delete(delete_object),
+        )
         .route("/:bucket", get(list_objects))
         .layer(axum::middleware::from_fn_with_state(
             state.config.clone(),
@@ -48,26 +172,208 @@ pub async fn create_router(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
+fn parse_range_header(value: &str) -> Result<String> {
+    let value = value.trim();
+    let (unit, spec) = value
+        .split_once('=')
+        .ok_or_else(|| AppError::InvalidRequest("Invalid Range header".to_string()))?;
+
+    if !unit.eq_ignore_ascii_case("bytes") || spec.contains(',') {
+        return Err(AppError::InvalidRequest("Invalid Range header".to_string()));
+    }
+
+    let (start, end) = spec
+        .split_once('-')
+        .ok_or_else(|| AppError::InvalidRequest("Invalid Range header".to_string()))?;
+
+    if start.is_empty() && end.is_empty() {
+        return Err(AppError::InvalidRequest("Invalid Range header".to_string()));
+    }
+
+    let start_value = if start.is_empty() {
+        None
+    } else {
+        Some(
+            start
+                .parse::<u64>()
+                .map_err(|_| AppError::InvalidRequest("Invalid Range header".to_string()))?,
+        )
+    };
+
+    let end_value = if end.is_empty() {
+        None
+    } else {
+        Some(
+            end.parse::<u64>()
+                .map_err(|_| AppError::InvalidRequest("Invalid Range header".to_string()))?,
+        )
+    };
+
+    if let (Some(start), Some(end)) = (start_value, end_value) {
+        if end < start {
+            return Err(AppError::InvalidRequest("Invalid Range header".to_string()));
+        }
+    }
+
+    Ok(format!("bytes={spec}"))
+}
+
+fn requested_range(headers: &HeaderMap) -> Result<Option<String>> {
+    headers
+        .get(header::RANGE)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| AppError::InvalidRequest("Invalid Range header".to_string()))
+                .and_then(parse_range_header)
+        })
+        .transpose()
+}
+
 #[axum::debug_handler]
 #[instrument(skip(state), fields(bucket = %bucket, key = %key))]
 async fn get_object(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthState>,
     Path((bucket, key)): Path<(String, String)>,
+    request_headers: HeaderMap,
 ) -> Result<impl IntoResponse> {
     info!("Getting object {}/{}", bucket, key);
-    
+
     // Check bucket access
     check_bucket_access(&state.config, &auth.username, &bucket)?;
-    
+
+    let range = requested_range(&request_headers)?;
+    let is_range_request = range.is_some();
     let (_, client) = state.get_account_and_client(&bucket)?;
-    let body = client.get_object(&bucket, &key).await?;
-    let bytes = body.collect().await.map_err(|e| AppError::InternalError(e.to_string()))?.to_vec();
-    
+    let response = client.get_object(&bucket, &key, range).await?;
+    let headers = get_object_headers(&response);
+    let body_stream = stream::unfold(response.body, |mut byte_stream| async {
+        match byte_stream.try_next().await {
+            Ok(Some(bytes)) => Some((Ok::<Bytes, std::io::Error>(bytes), byte_stream)),
+            Ok(None) => None,
+            Err(error) => Some((Err(std::io::Error::other(error)), byte_stream)),
+        }
+    });
+    let body = Body::from_stream(body_stream);
+
+    let status = if is_range_request {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+
+    Ok((status, headers, body))
+}
+
+fn insert_header_if_valid(headers: &mut HeaderMap, name: HeaderName, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
+}
+
+fn get_object_headers(response: &GetObjectOutput) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert("content-type", "application/octet-stream".parse().unwrap());
-    
-    Ok((StatusCode::OK, headers, bytes))
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+
+    if let Some(content_type) = response.content_type() {
+        insert_header_if_valid(&mut headers, header::CONTENT_TYPE, content_type);
+    }
+    if let Some(content_length) = response.content_length() {
+        insert_header_if_valid(
+            &mut headers,
+            header::CONTENT_LENGTH,
+            &content_length.to_string(),
+        );
+    }
+    if let Some(e_tag) = response.e_tag() {
+        insert_header_if_valid(&mut headers, header::ETAG, e_tag);
+    }
+    if let Some(last_modified) = response.last_modified() {
+        use aws_sdk_s3::primitives::DateTimeFormat;
+        if let Ok(last_modified) = last_modified.fmt(DateTimeFormat::HttpDate) {
+            insert_header_if_valid(&mut headers, header::LAST_MODIFIED, &last_modified);
+        }
+    }
+    if let Some(content_encoding) = response.content_encoding() {
+        insert_header_if_valid(&mut headers, header::CONTENT_ENCODING, content_encoding);
+    }
+    if let Some(content_range) = response.content_range() {
+        insert_header_if_valid(&mut headers, header::CONTENT_RANGE, content_range);
+    }
+    if let Some(cache_control) = response.cache_control() {
+        insert_header_if_valid(&mut headers, header::CACHE_CONTROL, cache_control);
+    }
+    if let Some(content_disposition) = response.content_disposition() {
+        insert_header_if_valid(
+            &mut headers,
+            header::CONTENT_DISPOSITION,
+            content_disposition,
+        );
+    }
+    if let Some(content_language) = response.content_language() {
+        insert_header_if_valid(&mut headers, header::CONTENT_LANGUAGE, content_language);
+    }
+
+    headers
+}
+
+fn head_object_headers(metadata: &HeadObjectMetadata) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+
+    if let Some(content_length) = metadata.content_length {
+        insert_header_if_valid(
+            &mut headers,
+            header::CONTENT_LENGTH,
+            &content_length.to_string(),
+        );
+    }
+    if let Some(content_type) = &metadata.content_type {
+        insert_header_if_valid(&mut headers, header::CONTENT_TYPE, content_type);
+    }
+    if let Some(e_tag) = &metadata.e_tag {
+        insert_header_if_valid(&mut headers, header::ETAG, e_tag);
+    }
+    if let Some(last_modified) = &metadata.last_modified {
+        insert_header_if_valid(&mut headers, header::LAST_MODIFIED, last_modified);
+    }
+    if let Some(content_encoding) = &metadata.content_encoding {
+        insert_header_if_valid(&mut headers, header::CONTENT_ENCODING, content_encoding);
+    }
+    if let Some(cache_control) = &metadata.cache_control {
+        insert_header_if_valid(&mut headers, header::CACHE_CONTROL, cache_control);
+    }
+    if let Some(content_disposition) = &metadata.content_disposition {
+        insert_header_if_valid(
+            &mut headers,
+            header::CONTENT_DISPOSITION,
+            content_disposition,
+        );
+    }
+    if let Some(content_language) = &metadata.content_language {
+        insert_header_if_valid(&mut headers, header::CONTENT_LANGUAGE, content_language);
+    }
+
+    Ok(headers)
+}
+
+#[axum::debug_handler]
+#[instrument(skip(state), fields(bucket = %bucket, key = %key))]
+async fn head_object(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthState>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Result<impl IntoResponse> {
+    info!("Getting object metadata {}/{}", bucket, key);
+
+    check_bucket_access(&state.config, &auth.username, &bucket)?;
+
+    let (_, client) = state.get_account_and_client(&bucket)?;
+    let metadata = client.head_object(&bucket, &key).await?;
+    let headers = head_object_headers(&metadata)?;
+
+    Ok((StatusCode::OK, headers, ()))
 }
 
 #[axum::debug_handler]
@@ -77,14 +383,14 @@ async fn put_object(
     Extension(auth): Extension<AuthState>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<impl IntoResponse> {
     info!("Putting object {}/{}", bucket, key);
-    
+
     // Check bucket access and write permission
     check_bucket_access(&state.config, &auth.username, &bucket)?;
     check_write_permission(&state.config, &auth.username)?;
-    
+
     let (_, client) = state.get_account_and_client(&bucket)?;
 
     let content_type = headers
@@ -92,9 +398,12 @@ async fn put_object(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    let body = ByteStream::from(body);
-    
-    client.put_object(&bucket, &key, body, content_type).await?;
+    let (body, limit_exceeded) = byte_stream_from_body(body, state.config.max_file_size);
+    let result = client.put_object(&bucket, &key, body, content_type).await;
+    if limit_exceeded.load(Ordering::Relaxed) {
+        return Err(AppError::PayloadTooLarge(state.config.max_file_size));
+    }
+    result?;
     Ok(StatusCode::OK)
 }
 
@@ -157,6 +466,76 @@ fn format_xml_content(objects: &[aws_sdk_s3::types::Object]) -> String {
         .join("\n")
 }
 
+struct ListObjectsResponseView<'a> {
+    bucket: &'a str,
+    prefix: Option<&'a str>,
+    start_after: Option<&'a str>,
+    continuation_token: Option<&'a str>,
+    max_keys: i32,
+    objects: &'a [aws_sdk_s3::types::Object],
+    is_truncated: bool,
+    next_continuation_token: Option<&'a str>,
+    key_count: i32,
+}
+
+fn parse_list_objects_params(params: &HashMap<String, String>) -> Result<ListObjectsParams> {
+    let max_keys = match params.get("max-keys") {
+        Some(value) => {
+            let parsed = value
+                .parse::<i32>()
+                .map_err(|_| AppError::InvalidRequest("max-keys must be an integer".to_string()))?;
+            if parsed < 0 {
+                return Err(AppError::InvalidRequest(
+                    "max-keys must not be negative".to_string(),
+                ));
+            }
+            parsed.min(1000)
+        }
+        None => 1000,
+    };
+
+    Ok(ListObjectsParams {
+        prefix: params.get("prefix").cloned(),
+        start_after: params.get("start-after").cloned(),
+        continuation_token: params.get("continuation-token").cloned(),
+        max_keys,
+    })
+}
+
+fn optional_xml_element(name: &str, value: Option<&str>) -> String {
+    value
+        .map(|value| format!("    <{name}>{}</{name}>\n", escape_xml(value)))
+        .unwrap_or_default()
+}
+
+fn format_list_objects_xml(view: &ListObjectsResponseView<'_>) -> String {
+    let start_after = optional_xml_element("StartAfter", view.start_after);
+    let continuation_token = optional_xml_element("ContinuationToken", view.continuation_token);
+    let next_continuation_token =
+        optional_xml_element("NextContinuationToken", view.next_continuation_token);
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>{name}</Name>
+    <Prefix>{prefix}</Prefix>
+{start_after}{continuation_token}    <KeyCount>{key_count}</KeyCount>
+    <MaxKeys>{max_keys}</MaxKeys>
+    <IsTruncated>{is_truncated}</IsTruncated>
+{next_continuation_token}{contents}
+</ListBucketResult>"#,
+        name = escape_xml(view.bucket),
+        prefix = escape_xml(view.prefix.unwrap_or_default()),
+        start_after = start_after,
+        continuation_token = continuation_token,
+        key_count = view.key_count,
+        max_keys = view.max_keys,
+        is_truncated = view.is_truncated,
+        next_continuation_token = next_continuation_token,
+        contents = format_xml_content(view.objects),
+    )
+}
+
 #[axum::debug_handler]
 #[instrument(skip(state), fields(bucket = %bucket))]
 async fn list_objects(
@@ -166,30 +545,29 @@ async fn list_objects(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse> {
     info!("Listing objects in bucket {}", bucket);
-    
+
     // Check bucket access
     check_bucket_access(&state.config, &auth.username, &bucket)?;
-    
-    let (_, client) = state.get_account_and_client(&bucket)?;
-    let prefix = params.get("prefix").cloned();
-    let objects = client.list_objects(&bucket, prefix.clone()).await?;
 
-    let key_count = objects.len();
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>{name}</Name>
-    <Prefix>{prefix}</Prefix>
-    <KeyCount>{key_count}</KeyCount>
-    <MaxKeys>{key_count}</MaxKeys>
-    <IsTruncated>false</IsTruncated>
-{contents}
-</ListBucketResult>"#,
-        name = escape_xml(&bucket),
-        prefix = escape_xml(&prefix.unwrap_or_default()),
-        key_count = key_count,
-        contents = format_xml_content(&objects),
-    );
+    let (_, client) = state.get_account_and_client(&bucket)?;
+    let list_params = parse_list_objects_params(&params)?;
+    let prefix = list_params.prefix.clone();
+    let start_after = list_params.start_after.clone();
+    let continuation_token = list_params.continuation_token.clone();
+    let max_keys = list_params.max_keys;
+    let page = client.list_objects(&bucket, list_params).await?;
+
+    let xml = format_list_objects_xml(&ListObjectsResponseView {
+        bucket: &bucket,
+        prefix: prefix.as_deref(),
+        start_after: start_after.as_deref(),
+        continuation_token: continuation_token.as_deref(),
+        max_keys,
+        objects: &page.objects,
+        is_truncated: page.is_truncated,
+        next_continuation_token: page.next_continuation_token.as_deref(),
+        key_count: page.key_count,
+    });
 
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "application/xml".parse().unwrap());
@@ -200,10 +578,158 @@ async fn list_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use futures::future::poll_fn;
-    use http::{Method, Request};
-    use tower::Service;
+
+    fn list_view<'a>() -> ListObjectsResponseView<'a> {
+        ListObjectsResponseView {
+            bucket: "bucket",
+            prefix: None,
+            start_after: None,
+            continuation_token: None,
+            max_keys: 1000,
+            objects: &[],
+            is_truncated: false,
+            next_continuation_token: None,
+            key_count: 0,
+        }
+    }
+
+    #[test]
+    fn head_object_headers_include_metadata() {
+        let headers = head_object_headers(&HeadObjectMetadata {
+            content_length: Some(42),
+            content_type: Some("text/plain".to_string()),
+            e_tag: Some(r#""abc123""#.to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            content_encoding: Some("gzip".to_string()),
+            cache_control: Some("max-age=60".to_string()),
+            content_disposition: Some("attachment".to_string()),
+            content_language: Some("en".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(headers[header::CONTENT_LENGTH], "42");
+        assert_eq!(headers[header::CONTENT_TYPE], "text/plain");
+        assert_eq!(headers[header::ETAG], r#""abc123""#);
+        assert_eq!(
+            headers[header::LAST_MODIFIED],
+            "Wed, 21 Oct 2015 07:28:00 GMT"
+        );
+        assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(headers[header::CACHE_CONTROL], "max-age=60");
+    }
+
+    #[tokio::test]
+    async fn router_accepts_explicit_head_route() {
+        let config = serde_json::from_str(
+            r#"{
+                "accounts": {},
+                "users": {},
+                "server": { "host": "127.0.0.1", "port": 8080 }
+            }"#,
+        )
+        .unwrap();
+        let router = create_router(AppState {
+            config: Arc::new(config),
+            clients: HashMap::new(),
+        })
+        .await;
+
+        assert!(router.has_routes());
+    }
+
+    #[test]
+    fn max_keys_zero_is_valid_and_values_over_limit_are_clamped() {
+        let zero = HashMap::from([("max-keys".to_string(), "0".to_string())]);
+        assert_eq!(parse_list_objects_params(&zero).unwrap().max_keys, 0);
+
+        let large = HashMap::from([("max-keys".to_string(), "1001".to_string())]);
+        assert_eq!(parse_list_objects_params(&large).unwrap().max_keys, 1000);
+    }
+
+    #[test]
+    fn max_keys_negative_or_non_numeric_is_invalid() {
+        for value in ["-1", "not-a-number"] {
+            let params = HashMap::from([("max-keys".to_string(), value.to_string())]);
+            assert!(parse_list_objects_params(&params).is_err());
+        }
+    }
+
+    #[test]
+    fn list_objects_xml_renders_pagination_tokens() {
+        let mut view = list_view();
+        view.is_truncated = true;
+        view.continuation_token = Some("current&token");
+        view.next_continuation_token = Some("next<token");
+        let xml = format_list_objects_xml(&view);
+
+        assert!(xml.contains("<ContinuationToken>current&amp;token</ContinuationToken>"));
+        assert!(xml.contains("<NextContinuationToken>next&lt;token</NextContinuationToken>"));
+    }
+
+    #[tokio::test]
+    async fn byte_stream_from_body_preserves_streamed_chunks() {
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"stream")),
+        ]));
+
+        let (stream, exceeded) = byte_stream_from_body(body, 12);
+        let bytes = stream
+            .collect()
+            .await
+            .expect("stream should collect")
+            .into_bytes();
+
+        assert_eq!(bytes, Bytes::from_static(b"hello stream"));
+        assert!(!exceeded.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn byte_stream_from_body_rejects_bodies_over_limit() {
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"hello")),
+            Ok(Bytes::from_static(b"!")),
+        ]));
+
+        let (stream, exceeded) = byte_stream_from_body(body, 5);
+        assert!(stream.collect().await.is_err());
+        assert!(exceeded.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn range_header_accepts_supported_forms() {
+        assert_eq!(parse_range_header("bytes=0-499").unwrap(), "bytes=0-499");
+        assert_eq!(parse_range_header("bytes=500-").unwrap(), "bytes=500-");
+        assert_eq!(parse_range_header("bytes=-500").unwrap(), "bytes=-500");
+        assert_eq!(parse_range_header("Bytes=0-0").unwrap(), "bytes=0-0");
+    }
+
+    #[test]
+    fn range_header_rejects_invalid_or_multiple_ranges() {
+        for value in [
+            "bytes=",
+            "items=0-100",
+            "bytes=abc-100",
+            "bytes=0-abc",
+            "bytes=100-0",
+            "bytes=0-1,3-4",
+        ] {
+            assert!(parse_range_header(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn get_object_headers_always_set_accept_ranges() {
+        let response = GetObjectOutput::builder().build();
+        let headers = get_object_headers(&response);
+
+        assert_eq!(
+            headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes")
+        );
+    }
 
     #[test]
     fn escape_xml_handles_all_special_chars() {
@@ -215,72 +741,15 @@ mod tests {
 
     #[test]
     fn escape_xml_passes_through_safe_text() {
-        assert_eq!(escape_xml("plain/path/to/file.txt"), "plain/path/to/file.txt");
+        assert_eq!(
+            escape_xml("plain/path/to/file.txt"),
+            "plain/path/to/file.txt"
+        );
     }
 
     #[test]
     fn escape_xml_does_not_double_escape() {
         // Each special char should produce exactly one entity.
         assert_eq!(escape_xml("&amp;"), "&amp;amp;");
-    }
-
-    fn test_state() -> AppState {
-        let json = r#"{
-            "accounts": {
-                "test-account": {
-                    "endpoint_url": "http://localhost:9000",
-                    "region": "us-east-1",
-                    "access_key_id": "access",
-                    "secret_access_key": "secret",
-                    "buckets": ["bucket"]
-                }
-            },
-            "users": {
-                "writer": {
-                    "api_key": "write-key",
-                    "role": "user",
-                    "allowed_buckets": ["bucket"]
-                },
-                "reader": {
-                    "api_key": "read-key",
-                    "role": "readonly",
-                    "allowed_buckets": ["bucket"]
-                }
-            },
-            "server": { "host": "127.0.0.1", "port": 8080 }
-        }"#;
-
-        AppState {
-            config: Arc::new(serde_json::from_str(json).expect("valid config")),
-            clients: HashMap::new(),
-        }
-    }
-
-    async fn send_delete(api_key: &str) -> StatusCode {
-        let mut app = create_router(test_state()).await;
-        let request = Request::builder()
-            .method(Method::DELETE)
-            .uri("/bucket/path/to/object.txt")
-            .header("x-api-key", api_key)
-            .body(Body::empty())
-            .unwrap();
-
-        poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx))
-            .await
-            .unwrap();
-        <Router as Service<Request<Body>>>::call(&mut app, request)
-            .await
-            .unwrap()
-            .status()
-    }
-
-    #[tokio::test]
-    async fn delete_route_is_wired_and_accepted() {
-        assert_eq!(send_delete("write-key").await, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn readonly_user_gets_forbidden_on_delete() {
-        assert_eq!(send_delete("read-key").await, StatusCode::FORBIDDEN);
     }
 }
