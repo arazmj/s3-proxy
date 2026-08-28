@@ -1,10 +1,7 @@
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{
-    config::Credentials,
-    primitives::ByteStream,
-    types::Object,
-    Client,
-    error::SdkError,
+    config::Credentials, error::SdkError, operation::get_object::GetObjectOutput,
+    primitives::ByteStream, types::Object, Client,
 };
 use tracing::{info, instrument};
 
@@ -39,7 +36,7 @@ impl S3Client {
         secret_access_key: String,
     ) -> Result<Self> {
         info!("Creating new S3 client for endpoint {}", endpoint_url);
-        
+
         let config = aws_config::defaults(BehaviorVersion::latest())
             .endpoint_url(endpoint_url)
             .region(Region::new(region))
@@ -57,17 +54,19 @@ impl S3Client {
         Ok(Self { client })
     }
 
-    #[instrument(skip(self, params), fields(bucket = %bucket))]
-    pub async fn list_objects(&self, bucket: &str, params: ListObjectsParams) -> Result<ListObjectsPage> {
-        let max_keys = match params.max_keys {
-            1..=1000 => params.max_keys,
-            n if n > 1000 => 1000,
-            _ => return Err(AppError::InvalidRequest("max-keys must be at least 1".to_string())),
-        };
-
+    #[instrument(skip(self), fields(bucket = %bucket))]
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        params: ListObjectsParams,
+    ) -> Result<ListObjectsPage> {
         info!(
             "Listing objects in bucket {} with prefix {:?}, start-after {:?}, continuation-token {:?}, max-keys {}",
-            bucket, params.prefix, params.start_after, params.continuation_token, max_keys
+            bucket,
+            params.prefix,
+            params.start_after,
+            params.continuation_token,
+            params.max_keys
         );
 
         let response = self
@@ -77,43 +76,53 @@ impl S3Client {
             .set_prefix(params.prefix)
             .set_start_after(params.start_after)
             .set_continuation_token(params.continuation_token)
-            .set_max_keys(Some(max_keys))
+            .set_max_keys(Some(params.max_keys))
             .send()
             .await?;
 
         let objects = response.contents.unwrap_or_default();
-        let key_count = response.key_count.unwrap_or(objects.len() as i32);
         let page = ListObjectsPage {
+            key_count: response.key_count.unwrap_or(objects.len() as i32),
             objects,
             is_truncated: response.is_truncated.unwrap_or(false),
             next_continuation_token: response.next_continuation_token,
-            key_count,
         };
 
         info!(
             "Found {} objects in bucket {} (is_truncated: {})",
-            page.objects.len(), bucket, page.is_truncated
+            page.objects.len(),
+            bucket,
+            page.is_truncated
         );
         Ok(page)
     }
 
-    #[instrument(skip(self), fields(bucket = %bucket, key = %key))]
-    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<ByteStream> {
-        info!("Getting object {}/{}", bucket, key);
-        
-        match self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(response) => Ok(response.body),
+    #[instrument(skip(self), fields(bucket = %bucket, key = %key, range = ?range))]
+    pub async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<String>,
+    ) -> Result<GetObjectOutput> {
+        info!("Getting object {}/{} with range {:?}", bucket, key, range);
+
+        let mut request = self.client.get_object().bucket(bucket).key(key);
+        if let Some(range) = range {
+            request = request.range(range);
+        }
+
+        match request.send().await {
+            Ok(response) => Ok(response),
             Err(e) => {
                 if let SdkError::ServiceError(context) = &e {
                     if context.err().is_no_such_key() {
-                        return Err(AppError::ObjectNotFound(bucket.to_string(), key.to_string()));
+                        return Err(AppError::ObjectNotFound(
+                            bucket.to_string(),
+                            key.to_string(),
+                        ));
+                    }
+                    if context.raw().status().as_u16() == 416 {
+                        return Err(AppError::RangeNotSatisfiable);
                     }
                 }
                 Err(e.into())
@@ -130,13 +139,8 @@ impl S3Client {
         content_type: Option<String>,
     ) -> Result<()> {
         info!("Putting object {}/{}", bucket, key);
-        
-        let mut request = self
-            .client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(body);
+
+        let mut request = self.client.put_object().bucket(bucket).key(key).body(body);
 
         if let Some(content_type) = content_type {
             request = request.content_type(content_type);
@@ -146,4 +150,4 @@ impl S3Client {
         info!("Successfully put object {}/{}", bucket, key);
         Ok(())
     }
-} 
+}
