@@ -4,7 +4,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::IntoResponse,
-    routing::{get, put},
+    routing::get,
     Router,
 };
 use futures::{stream, TryStream};
@@ -22,7 +22,7 @@ use tracing::{info, instrument};
 use crate::auth::{auth_middleware, check_bucket_access, check_write_permission, AuthState};
 use crate::config::Config;
 use crate::error::{AppError, Result};
-use crate::s3::{ListObjectsParams, S3Client};
+use crate::s3::{HeadObjectMetadata, ListObjectsParams, S3Client};
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -157,8 +157,10 @@ impl AppState {
 
 pub async fn create_router(state: AppState) -> Router {
     Router::new()
-        .route("/:bucket/*key", get(get_object))
-        .route("/:bucket/*key", put(put_object))
+        .route(
+            "/:bucket/*key",
+            get(get_object).put(put_object).head(head_object),
+        )
         .route("/:bucket", get(list_objects))
         .layer(axum::middleware::from_fn_with_state(
             state.config.clone(),
@@ -311,6 +313,64 @@ fn get_object_headers(response: &GetObjectOutput) -> HeaderMap {
     }
 
     headers
+}
+
+fn head_object_headers(metadata: &HeadObjectMetadata) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+
+    if let Some(content_length) = metadata.content_length {
+        insert_header_if_valid(
+            &mut headers,
+            header::CONTENT_LENGTH,
+            &content_length.to_string(),
+        );
+    }
+    if let Some(content_type) = &metadata.content_type {
+        insert_header_if_valid(&mut headers, header::CONTENT_TYPE, content_type);
+    }
+    if let Some(e_tag) = &metadata.e_tag {
+        insert_header_if_valid(&mut headers, header::ETAG, e_tag);
+    }
+    if let Some(last_modified) = &metadata.last_modified {
+        insert_header_if_valid(&mut headers, header::LAST_MODIFIED, last_modified);
+    }
+    if let Some(content_encoding) = &metadata.content_encoding {
+        insert_header_if_valid(&mut headers, header::CONTENT_ENCODING, content_encoding);
+    }
+    if let Some(cache_control) = &metadata.cache_control {
+        insert_header_if_valid(&mut headers, header::CACHE_CONTROL, cache_control);
+    }
+    if let Some(content_disposition) = &metadata.content_disposition {
+        insert_header_if_valid(
+            &mut headers,
+            header::CONTENT_DISPOSITION,
+            content_disposition,
+        );
+    }
+    if let Some(content_language) = &metadata.content_language {
+        insert_header_if_valid(&mut headers, header::CONTENT_LANGUAGE, content_language);
+    }
+
+    Ok(headers)
+}
+
+#[axum::debug_handler]
+#[instrument(skip(state), fields(bucket = %bucket, key = %key))]
+async fn head_object(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthState>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Result<impl IntoResponse> {
+    info!("Getting object metadata {}/{}", bucket, key);
+
+    check_bucket_access(&state.config, &auth.username, &bucket)?;
+
+    let (_, client) = state.get_account_and_client(&bucket)?;
+    let metadata = client.head_object(&bucket, &key).await?;
+    let headers = head_object_headers(&metadata)?;
+
+    Ok((StatusCode::OK, headers, ()))
 }
 
 #[axum::debug_handler]
@@ -510,6 +570,50 @@ mod tests {
             next_continuation_token: None,
             key_count: 0,
         }
+    }
+
+    #[test]
+    fn head_object_headers_include_metadata() {
+        let headers = head_object_headers(&HeadObjectMetadata {
+            content_length: Some(42),
+            content_type: Some("text/plain".to_string()),
+            e_tag: Some(r#""abc123""#.to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            content_encoding: Some("gzip".to_string()),
+            cache_control: Some("max-age=60".to_string()),
+            content_disposition: Some("attachment".to_string()),
+            content_language: Some("en".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(headers[header::CONTENT_LENGTH], "42");
+        assert_eq!(headers[header::CONTENT_TYPE], "text/plain");
+        assert_eq!(headers[header::ETAG], r#""abc123""#);
+        assert_eq!(
+            headers[header::LAST_MODIFIED],
+            "Wed, 21 Oct 2015 07:28:00 GMT"
+        );
+        assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(headers[header::CACHE_CONTROL], "max-age=60");
+    }
+
+    #[tokio::test]
+    async fn router_accepts_explicit_head_route() {
+        let config = serde_json::from_str(
+            r#"{
+                "accounts": {},
+                "users": {},
+                "server": { "host": "127.0.0.1", "port": 8080 }
+            }"#,
+        )
+        .unwrap();
+        let router = create_router(AppState {
+            config: Arc::new(config),
+            clients: HashMap::new(),
+        })
+        .await;
+
+        assert!(router.has_routes());
     }
 
     #[test]

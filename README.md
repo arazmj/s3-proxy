@@ -110,6 +110,7 @@ The `x-api-key` header is automatically redacted from request logs.
 |--------|-----------------------|--------------------------------------------------------------|
 | GET    | `/{bucket}`           | List objects with S3 V2 pagination query parameters.        |
 | GET    | `/{bucket}/{key}`     | Stream an object. Supports single `Range: bytes=…` requests. |
+| HEAD   | `/{bucket}/{key}`     | Return object metadata without downloading the object.      |
 | PUT    | `/{bucket}/{key}`     | Upload an object. Body is forwarded verbatim.                |
 
 All requests must include `x-api-key: <value>`; otherwise the proxy responds

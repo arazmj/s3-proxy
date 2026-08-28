@@ -27,6 +27,18 @@ pub struct ListObjectsPage {
     pub key_count: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadObjectMetadata {
+    pub content_length: Option<i64>,
+    pub content_type: Option<String>,
+    pub e_tag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_encoding: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_language: Option<String>,
+}
+
 impl S3Client {
     #[instrument(skip(endpoint_url, region, access_key_id, secret_access_key))]
     pub async fn new(
@@ -126,6 +138,47 @@ impl S3Client {
                     }
                 }
                 Err(e.into())
+            }
+        }
+    }
+
+    #[instrument(skip(self), fields(bucket = %bucket, key = %key))]
+    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectMetadata> {
+        info!("Getting object metadata {}/{}", bucket, key);
+
+        match self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(response) => Ok(HeadObjectMetadata {
+                content_length: response.content_length(),
+                content_type: response.content_type().map(String::from),
+                e_tag: response.e_tag().map(String::from),
+                last_modified: response.last_modified().and_then(|date| {
+                    date.fmt(aws_sdk_s3::primitives::DateTimeFormat::HttpDate)
+                        .ok()
+                }),
+                content_encoding: response.content_encoding().map(String::from),
+                cache_control: response.cache_control().map(String::from),
+                content_disposition: response.content_disposition().map(String::from),
+                content_language: response.content_language().map(String::from),
+            }),
+            Err(error) => {
+                if let SdkError::ServiceError(context) = &error {
+                    if context.err().is_not_found() {
+                        return Err(AppError::ObjectNotFound(
+                            bucket.to_string(),
+                            key.to_string(),
+                        ));
+                    }
+                }
+                Err(AppError::InternalError(format!(
+                    "S3 HeadObject error: {error}"
+                )))
             }
         }
     }
