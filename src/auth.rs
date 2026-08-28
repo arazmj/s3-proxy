@@ -1,14 +1,10 @@
 use axum::{
-    extract::Request,
-    http::header,
-    middleware::Next,
+    extract::Request, extract::State, http::header, middleware::Next, response::IntoResponse,
     response::Response,
-    extract::State,
-    response::IntoResponse,
 };
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 use tracing::{info, warn};
 
 use crate::config::{Config, RateLimitConfig};
@@ -77,9 +73,13 @@ fn validate_request(config: &Config, request: &Request) -> Result<()> {
     // Check content length for PUT requests
     if request.method() == http::Method::PUT {
         // Check write permissions
-        if let Some(api_key) = request.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
+        if let Some(api_key) = request
+            .headers()
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+        {
             if let Some((username, _)) = config.find_user_by_api_key(api_key) {
-                check_write_permission(config, &username)?;
+                check_write_permission(config, username)?;
             }
         }
 
@@ -129,6 +129,7 @@ fn validate_request(config: &Config, request: &Request) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use axum::body::Body;
@@ -149,7 +150,10 @@ mod tests {
     }
 
     fn rate_cfg(max_requests: u32, window_secs: u64) -> RateLimitConfig {
-        RateLimitConfig { max_requests, window_secs }
+        RateLimitConfig {
+            max_requests,
+            window_secs,
+        }
     }
 
     fn req(method: http::Method, path: &str) -> Request {
@@ -180,7 +184,10 @@ mod tests {
         let cfg = make_config();
         validate_request(
             &cfg,
-            &req(http::Method::GET, "/mybucket/path/to/deeply/nested/file.txt"),
+            &req(
+                http::Method::GET,
+                "/mybucket/path/to/deeply/nested/file.txt",
+            ),
         )
         .expect("nested object keys must be allowed");
     }
@@ -310,7 +317,8 @@ pub async fn auth_middleware(
     let api_key = match request
         .headers()
         .get("x-api-key")
-        .and_then(|v| v.to_str().ok()) {
+        .and_then(|v| v.to_str().ok())
+    {
         Some(key) => key,
         None => {
             warn!("No API key provided");
@@ -330,7 +338,7 @@ pub async fn auth_middleware(
     // Check rate limit
     let limited = {
         let mut limiter = rate_limiter().lock().expect("rate limiter mutex poisoned");
-        limiter.is_rate_limited(&username, config.rate_limit)
+        limiter.is_rate_limited(username, config.rate_limit)
     };
     if limited {
         warn!("Rate limit exceeded for user {}", username);
@@ -351,9 +359,15 @@ pub async fn auth_middleware(
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
     headers.insert("X-Frame-Options", "DENY".parse().unwrap());
     headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
-    headers.insert("Strict-Transport-Security", "max-age=31536000; includeSubDomains".parse().unwrap());
+    headers.insert(
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains".parse().unwrap(),
+    );
 
-    info!("Authenticated user: {} with role: {:?}", username, user.role);
+    info!(
+        "Authenticated user: {} with role: {:?}",
+        username, user.role
+    );
     response
 }
 
@@ -371,7 +385,9 @@ pub fn check_bucket_access(config: &Config, username: &str, bucket: &str) -> Res
 pub fn check_write_permission(config: &Config, username: &str) -> Result<()> {
     if !config.can_write(username) {
         warn!("User {} not allowed to write", username);
-        return Err(AppError::Unauthorized("Write permission denied".to_string()));
+        return Err(AppError::Unauthorized(
+            "Write permission denied".to_string(),
+        ));
     }
     Ok(())
-} 
+}

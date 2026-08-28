@@ -1,42 +1,40 @@
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::{
+    get_object::GetObjectError, list_objects_v2::ListObjectsV2Error, put_object::PutObjectError,
+};
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
 use thiserror::Error;
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::operation::{
-    list_objects_v2::ListObjectsV2Error,
-    get_object::GetObjectError,
-    put_object::PutObjectError,
-};
 
 #[derive(Error, Debug)]
 pub enum AppError {
     // S3 operation errors
     #[error("S3 error: {0}")]
-    S3Error(#[from] aws_sdk_s3::Error),
-    
+    S3Error(Box<aws_sdk_s3::Error>),
+
     #[error("S3 ListObjects error: {0}")]
-    ListObjectsError(#[from] SdkError<ListObjectsV2Error>),
-    
+    ListObjectsError(Box<SdkError<ListObjectsV2Error>>),
+
     #[error("S3 GetObject error: {0}")]
-    GetObjectError(#[from] SdkError<GetObjectError>),
-    
+    GetObjectError(Box<SdkError<GetObjectError>>),
+
     #[error("S3 PutObject error: {0}")]
-    PutObjectError(#[from] SdkError<PutObjectError>),
-    
+    PutObjectError(Box<SdkError<PutObjectError>>),
+
     // Resource not found errors
     #[error("Bucket not found: {0}")]
     BucketNotFound(String),
-    
+
     #[error("Object not found: {0}/{1}")]
     ObjectNotFound(String, String),
-    
+
     // System errors
     #[error("Configuration error: {0}")]
-    ConfigError(#[from] std::io::Error),
-    
+    ConfigError(Box<std::io::Error>),
+
     #[error("Internal server error: {0}")]
     InternalError(String),
 
@@ -51,60 +49,74 @@ pub enum AppError {
     RateLimited(String),
 }
 
+impl From<aws_sdk_s3::Error> for AppError {
+    fn from(error: aws_sdk_s3::Error) -> Self {
+        Self::S3Error(Box::new(error))
+    }
+}
+
+impl From<SdkError<ListObjectsV2Error>> for AppError {
+    fn from(error: SdkError<ListObjectsV2Error>) -> Self {
+        Self::ListObjectsError(Box::new(error))
+    }
+}
+
+impl From<SdkError<GetObjectError>> for AppError {
+    fn from(error: SdkError<GetObjectError>) -> Self {
+        Self::GetObjectError(Box::new(error))
+    }
+}
+
+impl From<SdkError<PutObjectError>> for AppError {
+    fn from(error: SdkError<PutObjectError>) -> Self {
+        Self::PutObjectError(Box::new(error))
+    }
+}
+
+impl From<std::io::Error> for AppError {
+    fn from(error: std::io::Error) -> Self {
+        Self::ConfigError(Box::new(error))
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, error_message) = match self {
             // Not found errors
-            AppError::BucketNotFound(bucket) => (
-                StatusCode::NOT_FOUND,
-                format!("Bucket not found: {}", bucket)
-            ),
+            AppError::BucketNotFound(bucket) => {
+                (StatusCode::NOT_FOUND, format!("Bucket not found: {bucket}"))
+            }
             AppError::ObjectNotFound(bucket, key) => (
                 StatusCode::NOT_FOUND,
-                format!("Object not found: {}/{}", bucket, key)
+                format!("Object not found: {bucket}/{key}"),
             ),
-            
+
             // S3 operation errors
-            AppError::S3Error(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("S3 error: {}", e)
-            ),
+            AppError::S3Error(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("S3 error: {e}")),
             AppError::ListObjectsError(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("S3 ListObjects error: {}", e)
+                format!("S3 ListObjects error: {e}"),
             ),
             AppError::GetObjectError(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("S3 GetObject error: {}", e)
+                format!("S3 GetObject error: {e}"),
             ),
             AppError::PutObjectError(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("S3 PutObject error: {}", e)
+                format!("S3 PutObject error: {e}"),
             ),
-            
+
             // System errors
             AppError::ConfigError(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Configuration error: {}", e)
+                format!("Configuration error: {e}"),
             ),
-            AppError::InternalError(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                e
-            ),
+            AppError::InternalError(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
 
             // Authentication and authorization errors
-            AppError::Unauthorized(e) => (
-                StatusCode::UNAUTHORIZED,
-                e
-            ),
-            AppError::InvalidRequest(e) => (
-                StatusCode::BAD_REQUEST,
-                e
-            ),
-            AppError::RateLimited(e) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                e
-            ),
+            AppError::Unauthorized(e) => (StatusCode::UNAUTHORIZED, e),
+            AppError::InvalidRequest(e) => (StatusCode::BAD_REQUEST, e),
+            AppError::RateLimited(e) => (StatusCode::TOO_MANY_REQUESTS, e),
         };
 
         let body = ErrorBody {
@@ -117,10 +129,9 @@ impl IntoResponse for AppError {
             .unwrap_or_else(|_| r#"{"error":"internal error","status":500}"#.to_string());
 
         let mut response = (status, body).into_response();
-        response.headers_mut().insert(
-            "content-type",
-            "application/json".parse().unwrap()
-        );
+        response
+            .headers_mut()
+            .insert("content-type", "application/json".parse().unwrap());
         response
     }
 }

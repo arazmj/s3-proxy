@@ -1,14 +1,32 @@
 # S3 Proxy
 
-A Rust-based S3 proxy server that aggregates multiple S3 data sources into a single S3-compatible endpoint.
+A small Rust-based, S3-compatible HTTP proxy. It sits in front of one or more
+S3 backends (AWS S3, MinIO, etc.), authenticates clients with an API key,
+enforces per-user bucket allow-lists and read/write roles, and forwards the
+request to whichever backend account owns the target bucket.
+
+The proxy is **not** a caching layer or a multi-source aggregator — each
+bucket name maps to exactly one configured backend account.
 
 ## Features
 
-- S3-compatible API endpoints
-- Aggregates multiple S3 sources
-- Caches objects in a target S3 bucket
-- Supports standard S3 operations (GET, PUT, LIST)
-- Configurable through a configuration file
+- S3-compatible HTTP endpoints: `GET /{bucket}`, `GET /{bucket}/{key}`,
+  `PUT /{bucket}/{key}` (nested keys with `/` are supported).
+- Multi-backend routing: configure several S3 accounts (each with its own
+  endpoint, region, and credentials) and a list of buckets each owns; the
+  proxy dispatches requests to the right one based on the bucket in the URL.
+- API-key authentication via the `x-api-key` header.
+- Per-user bucket allow-lists (`["bucket1", "bucket2"]` or `["*"]`).
+- Three roles: `admin`, `user`, `readonly`. `admin` and `user` may write;
+  `readonly` is GET-only.
+- Per-user sliding-window rate limiting (default 100 req/min).
+- Configurable max upload size (default 100 MiB).
+- Path-traversal defense in the request validator (`.`, `..`, `//`,
+  trailing `/` are rejected).
+- Security response headers (`X-Content-Type-Options`, `X-Frame-Options`,
+  `Strict-Transport-Security`).
+- JSON error responses (`{"error": "...", "status": <code>}`) and
+  S3-compliant XML for `ListObjects`.
 
 ## Building
 
@@ -18,39 +36,63 @@ cargo build --release
 
 ## Configuration
 
-The proxy is configured through a JSON configuration file. Here's an example configuration:
+The proxy reads `config.json` from the current working directory at startup.
 
-```json
+### Schema
+
+```jsonc
 {
-  "sources": {
-    "source1": {
-      "endpoint_url": "http://source1:9000",
-      "region": "us-east-1",
-      "access_key_id": "minioadmin",
-      "secret_access_key": "minioadmin",
-      "bucket": "source1-bucket",
-      "prefix": "optional/prefix"
-    },
-    "source2": {
-      "endpoint_url": "http://source2:9000",
-      "region": "us-east-1",
-      "access_key_id": "minioadmin",
-      "secret_access_key": "minioadmin",
-      "bucket": "source2-bucket",
-      "prefix": null
+  // Backend S3 accounts. The key (e.g. "minio") is an internal account id
+  // used only in logs; the proxy picks an account by matching the bucket in
+  // the URL against each account's "buckets" list.
+  "accounts": {
+    "<account-id>": {
+      "endpoint_url":      "http://host:port",   // S3 endpoint (any S3-compatible service)
+      "region":            "us-east-1",
+      "access_key_id":     "...",
+      "secret_access_key": "...",
+      "buckets":           ["bucket1", "bucket2"] // buckets this account owns
     }
   },
-  "target": {
-    "endpoint_url": "http://target:9000",
-    "region": "us-east-1",
-    "access_key_id": "minioadmin",
-    "secret_access_key": "minioadmin",
-    "bucket": "target-bucket",
-    "prefix": null
+
+  // API consumers. The key (e.g. "admin") is the username surfaced in logs.
+  "users": {
+    "<username>": {
+      "api_key":         "secret-string",        // value the client sends in x-api-key
+      "role":            "admin",                // "admin" | "user" | "readonly"
+      "allowed_buckets": ["bucket1"]             // or ["*"] for any bucket
+    }
   },
-  "port": 8080
+
+  // HTTP listener.
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080
+  },
+
+  // Optional. Maximum body size accepted on PUT. Default: 104857600 (100 MiB).
+  "max_file_size": 104857600,
+
+  // Optional. Per-user sliding-window request limit.
+  "rate_limit": {
+    "max_requests": 100,
+    "window_secs": 60
+  }
 }
 ```
+
+A working example for a local MinIO instance ships in [`config.json`](config.json).
+
+### Roles
+
+| Role       | GET | PUT |
+|------------|:---:|:---:|
+| `admin`    |  ✅ |  ✅ |
+| `user`     |  ✅ |  ✅ |
+| `readonly` |  ✅ |  ❌ |
+
+A user is restricted to the buckets named in `allowed_buckets`; use `["*"]`
+to grant access to every bucket the proxy knows about.
 
 ## Running
 
@@ -58,29 +100,72 @@ The proxy is configured through a JSON configuration file. Here's an example con
 RUST_LOG=info ./target/release/s3-proxy
 ```
 
-## API Endpoints
+Logs are emitted via `tracing-subscriber` and respect the standard
+`RUST_LOG` env-filter syntax (e.g. `RUST_LOG=s3_proxy=debug,info`).
+The `x-api-key` header is automatically redacted from request logs.
 
-The proxy implements the following S3-compatible endpoints:
+## API
 
-- `GET /{bucket}?prefix={prefix}` - List objects in a bucket
-- `GET /{bucket}/{key}` - Get an object
-- `PUT /{bucket}/{key}` - Put an object
+| Method | Path                  | Description                                                  |
+|--------|-----------------------|--------------------------------------------------------------|
+| GET    | `/{bucket}?prefix=…`  | List objects in `bucket`. Returns S3 `ListBucketResult` XML. |
+| GET    | `/{bucket}/{key}`     | Fetch an object. `{key}` may contain `/`.                    |
+| PUT    | `/{bucket}/{key}`     | Upload an object. Body is forwarded verbatim.                |
 
-## Usage with S3 Clients
+All requests must include `x-api-key: <value>`; otherwise the proxy responds
+with `401 Unauthorized`.
 
-The proxy is compatible with any S3 client. Here's an example using the AWS CLI:
+### Status codes
+
+| Code | Meaning                                                       |
+|-----:|---------------------------------------------------------------|
+|  200 | Success.                                                      |
+|  400 | Malformed path (e.g. `..`, `//`, trailing `/`) or oversize body. |
+|  401 | Missing/invalid API key, bucket not in user's allow-list, or  `readonly` user attempted PUT. |
+|  429 | Per-user request limit exceeded.                              |
+|  404 | Bucket or object not found.                                   |
+|  500 | Internal / upstream S3 error.                                 |
+
+Error bodies are always JSON:
+
+```json
+{ "error": "Object not found: bucket1/missing.txt", "status": 404 }
+```
+
+## Usage with S3 clients
+
+The endpoint is S3-compatible, so any S3 SDK works. Note that the proxy
+authenticates by `x-api-key`, **not** SigV4, so most CLIs need to be told
+to send the header explicitly. With `curl`:
 
 ```bash
-# List objects
-aws --endpoint-url http://localhost:8080 s3 ls s3://my-bucket/
+# List
+curl -H 'x-api-key: admin-secret-key' \
+     'http://localhost:8080/bucket1?prefix=logs/'
 
-# Get an object
-aws --endpoint-url http://localhost:8080 s3 cp s3://my-bucket/my-object.txt .
+# Get
+curl -H 'x-api-key: admin-secret-key' \
+     http://localhost:8080/bucket1/path/to/file.txt -o file.txt
 
-# Put an object
-aws --endpoint-url http://localhost:8080 s3 cp my-object.txt s3://my-bucket/
+# Put
+curl -H 'x-api-key: admin-secret-key' \
+     -T ./file.txt \
+     http://localhost:8080/bucket1/path/to/file.txt
+```
+
+## Local development / smoke test
+
+[`test.sh`](test.sh) spins up a MinIO container, creates the buckets used in
+the bundled `config.json`, and exercises admin / user / readonly access plus
+rate limiting against a locally running proxy. Start the proxy in one
+terminal (`cargo run`) and then run `./test.sh`.
+
+## Tests
+
+```bash
+cargo test
 ```
 
 ## License
 
-MIT 
+MIT

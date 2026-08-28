@@ -1,10 +1,6 @@
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{
-    config::Credentials,
-    primitives::ByteStream,
-    types::Object,
-    Client,
-    error::SdkError,
+    config::Credentials, error::SdkError, primitives::ByteStream, types::Object, Client,
 };
 use tracing::{info, instrument};
 
@@ -23,7 +19,7 @@ impl S3Client {
         secret_access_key: String,
     ) -> Result<Self> {
         info!("Creating new S3 client for endpoint {}", endpoint_url);
-        
+
         let config = aws_config::defaults(BehaviorVersion::latest())
             .endpoint_url(endpoint_url)
             .region(Region::new(region))
@@ -43,8 +39,11 @@ impl S3Client {
 
     #[instrument(skip(self), fields(bucket = %bucket))]
     pub async fn list_objects(&self, bucket: &str, prefix: Option<String>) -> Result<Vec<Object>> {
-        info!("Listing objects in bucket {} with prefix {:?}", bucket, prefix);
-        
+        info!(
+            "Listing objects in bucket {} with prefix {:?}",
+            bucket, prefix
+        );
+
         let mut objects = Vec::new();
         let mut continuation_token = None;
 
@@ -75,7 +74,7 @@ impl S3Client {
     #[instrument(skip(self), fields(bucket = %bucket, key = %key))]
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<ByteStream> {
         info!("Getting object {}/{}", bucket, key);
-        
+
         match self
             .client
             .get_object()
@@ -88,7 +87,10 @@ impl S3Client {
             Err(e) => {
                 if let SdkError::ServiceError(context) = &e {
                     if context.err().is_no_such_key() {
-                        return Err(AppError::ObjectNotFound(bucket.to_string(), key.to_string()));
+                        return Err(AppError::ObjectNotFound(
+                            bucket.to_string(),
+                            key.to_string(),
+                        ));
                     }
                 }
                 Err(e.into())
@@ -105,13 +107,8 @@ impl S3Client {
         content_type: Option<String>,
     ) -> Result<()> {
         info!("Putting object {}/{}", bucket, key);
-        
-        let mut request = self
-            .client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(body);
+
+        let mut request = self.client.put_object().bucket(bucket).key(key).body(body);
 
         if let Some(content_type) = content_type {
             request = request.content_type(content_type);
@@ -121,4 +118,4 @@ impl S3Client {
         info!("Successfully put object {}/{}", bucket, key);
         Ok(())
     }
-} 
+}
