@@ -1,12 +1,13 @@
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::{operation::get_object::GetObjectOutput, primitives::ByteStream};
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Extension, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, put},
     Router,
 };
+use futures::stream;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -62,17 +63,54 @@ async fn get_object(
     check_bucket_access(&state.config, &auth.username, &bucket)?;
 
     let (_, client) = state.get_account_and_client(&bucket)?;
-    let body = client.get_object(&bucket, &key).await?;
-    let bytes = body
-        .collect()
-        .await
-        .map_err(|e| AppError::InternalError(e.to_string()))?
-        .to_vec();
+    let response = client.get_object(&bucket, &key).await?;
+    let headers = get_object_headers(&response);
+    let body_stream = stream::unfold(response.body, |mut byte_stream| async {
+        match byte_stream.try_next().await {
+            Ok(Some(bytes)) => Some((Ok::<Bytes, std::io::Error>(bytes), byte_stream)),
+            Ok(None) => None,
+            Err(error) => Some((Err(std::io::Error::other(error)), byte_stream)),
+        }
+    });
+    let body = Body::from_stream(body_stream);
 
+    Ok((StatusCode::OK, headers, body))
+}
+
+fn insert_header_if_valid(headers: &mut HeaderMap, name: HeaderName, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
+}
+
+fn get_object_headers(response: &GetObjectOutput) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert("content-type", "application/octet-stream".parse().unwrap());
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
-    Ok((StatusCode::OK, headers, bytes))
+    if let Some(content_type) = response.content_type() {
+        insert_header_if_valid(&mut headers, header::CONTENT_TYPE, content_type);
+    }
+    if let Some(content_length) = response.content_length() {
+        insert_header_if_valid(
+            &mut headers,
+            header::CONTENT_LENGTH,
+            &content_length.to_string(),
+        );
+    }
+    if let Some(e_tag) = response.e_tag() {
+        insert_header_if_valid(&mut headers, header::ETAG, e_tag);
+    }
+    if let Some(last_modified) = response.last_modified() {
+        use aws_sdk_s3::primitives::DateTimeFormat;
+        if let Ok(last_modified) = last_modified.fmt(DateTimeFormat::HttpDate) {
+            insert_header_if_valid(&mut headers, header::LAST_MODIFIED, &last_modified);
+        }
+    }
+    if let Some(content_encoding) = response.content_encoding() {
+        insert_header_if_valid(&mut headers, header::CONTENT_ENCODING, content_encoding);
+    }
+
+    headers
 }
 
 #[axum::debug_handler]
@@ -187,6 +225,19 @@ async fn list_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_object_headers_always_set_accept_ranges() {
+        let response = GetObjectOutput::builder().build();
+        let headers = get_object_headers(&response);
+
+        assert_eq!(
+            headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes")
+        );
+    }
 
     #[test]
     fn escape_xml_handles_all_special_chars() {
