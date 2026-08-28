@@ -50,6 +50,9 @@ pub enum AppError {
 
     #[error("Requested range is not satisfiable")]
     RangeNotSatisfiable,
+
+    #[error("Request body exceeds maximum allowed size of {0} bytes")]
+    PayloadTooLarge(u64),
 }
 
 impl From<aws_sdk_s3::Error> for AppError {
@@ -123,6 +126,10 @@ impl IntoResponse for AppError {
             AppError::RangeNotSatisfiable => (
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "Requested range is not satisfiable".to_string(),
+            ),
+            AppError::PayloadTooLarge(limit) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Request body exceeds maximum allowed size of {limit} bytes"),
             ),
         };
 

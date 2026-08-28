@@ -120,8 +120,9 @@ with `401 Unauthorized`.
 | Code | Meaning                                                       |
 |-----:|---------------------------------------------------------------|
 |  200 | Success.                                                      |
-|  400 | Malformed path (e.g. `..`, `//`, trailing `/`) or oversize body. |
+|  400 | Malformed path (e.g. `..`, `//`, trailing `/`).                 |
 |  401 | Missing/invalid API key, bucket not in user's allow-list, or  `readonly` user attempted PUT. |
+|  413 | Upload exceeds `max_file_size`.                               |
 |  429 | Per-user request limit exceeded.                              |
 |  404 | Bucket or object not found.                                   |
 |  500 | Internal / upstream S3 error.                                 |

@@ -7,15 +7,132 @@ use axum::{
     routing::{get, put},
     Router,
 };
-use futures::stream;
+use futures::{stream, TryStream};
+use http_body::Frame;
+use pin_project_lite::pin_project;
 use std::collections::HashMap;
+use std::error::Error as StdError;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use sync_wrapper::SyncWrapper;
 use tracing::{info, instrument};
 
 use crate::auth::{auth_middleware, check_bucket_access, check_write_permission, AuthState};
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::s3::S3Client;
+
+type BoxError = Box<dyn StdError + Send + Sync>;
+
+pin_project! {
+    struct LimitedStream<S> {
+        #[pin]
+        stream: S,
+        remaining: u64,
+        exceeded: Arc<AtomicBool>,
+        done: bool,
+    }
+}
+
+impl<S> LimitedStream<S> {
+    fn new(stream: S, limit: u64, exceeded: Arc<AtomicBool>) -> Self {
+        Self {
+            stream,
+            remaining: limit,
+            exceeded,
+            done: false,
+        }
+    }
+}
+
+impl<S, E> futures::Stream for LimitedStream<S>
+where
+    S: TryStream<Error = E>,
+    S::Ok: Into<Bytes>,
+    E: Into<BoxError>,
+{
+    type Item = std::result::Result<Bytes, BoxError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if *this.done {
+            return Poll::Ready(None);
+        }
+
+        match futures::ready!(this.stream.as_mut().try_poll_next(cx)) {
+            Some(Ok(chunk)) => {
+                let bytes = chunk.into();
+                if bytes.len() as u64 > *this.remaining {
+                    this.exceeded.store(true, Ordering::Relaxed);
+                    *this.done = true;
+                    Poll::Ready(Some(Err(std::io::Error::other(
+                        "request body exceeds configured maximum",
+                    )
+                    .into())))
+                } else {
+                    *this.remaining -= bytes.len() as u64;
+                    Poll::Ready(Some(Ok(bytes)))
+                }
+            }
+            Some(Err(error)) => {
+                *this.done = true;
+                Poll::Ready(Some(Err(error.into())))
+            }
+            None => {
+                *this.done = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+pin_project! {
+    struct SyncStreamBody<S> {
+        #[pin]
+        stream: SyncWrapper<S>,
+    }
+}
+
+impl<S> SyncStreamBody<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream: SyncWrapper::new(stream),
+        }
+    }
+}
+
+impl<S, E> http_body::Body for SyncStreamBody<S>
+where
+    S: TryStream<Error = E>,
+    S::Ok: Into<Bytes>,
+    E: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let stream = self.project().stream.get_pin_mut();
+        match futures::ready!(stream.try_poll_next(cx)) {
+            Some(Ok(chunk)) => Poll::Ready(Some(Ok(Frame::data(chunk.into())))),
+            Some(Err(error)) => Poll::Ready(Some(Err(error.into()))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+fn byte_stream_from_body(body: Body, limit: u64) -> (ByteStream, Arc<AtomicBool>) {
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let stream = LimitedStream::new(body.into_data_stream(), limit, exceeded.clone());
+    (
+        ByteStream::from_body_1_x(SyncStreamBody::new(stream)),
+        exceeded,
+    )
+}
 
 pub struct AppState {
     pub config: Arc<Config>,
@@ -203,7 +320,7 @@ async fn put_object(
     Extension(auth): Extension<AuthState>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<impl IntoResponse> {
     info!("Putting object {}/{}", bucket, key);
 
@@ -218,9 +335,12 @@ async fn put_object(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    let body = ByteStream::from(body);
-
-    client.put_object(&bucket, &key, body, content_type).await?;
+    let (body, limit_exceeded) = byte_stream_from_body(body, state.config.max_file_size);
+    let result = client.put_object(&bucket, &key, body, content_type).await;
+    if limit_exceeded.load(Ordering::Relaxed) {
+        return Err(AppError::PayloadTooLarge(state.config.max_file_size));
+    }
+    result?;
     Ok(StatusCode::OK)
 }
 
@@ -308,6 +428,36 @@ async fn list_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn byte_stream_from_body_preserves_streamed_chunks() {
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"stream")),
+        ]));
+
+        let (stream, exceeded) = byte_stream_from_body(body, 12);
+        let bytes = stream
+            .collect()
+            .await
+            .expect("stream should collect")
+            .into_bytes();
+
+        assert_eq!(bytes, Bytes::from_static(b"hello stream"));
+        assert!(!exceeded.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn byte_stream_from_body_rejects_bodies_over_limit() {
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"hello")),
+            Ok(Bytes::from_static(b"!")),
+        ]));
+
+        let (stream, exceeded) = byte_stream_from_body(body, 5);
+        assert!(stream.collect().await.is_err());
+        assert!(exceeded.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn range_header_accepts_supported_forms() {

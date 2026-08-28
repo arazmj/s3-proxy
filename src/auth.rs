@@ -105,10 +105,7 @@ fn validate_request(config: &Config, request: &Request) -> Result<()> {
             if let Ok(s) = content_length.to_str() {
                 if let Ok(length) = s.parse::<u64>() {
                     if length > config.max_file_size {
-                        return Err(AppError::InvalidRequest(format!(
-                            "File size {} exceeds maximum allowed size of {} bytes",
-                            length, config.max_file_size
-                        )));
+                        return Err(AppError::PayloadTooLarge(config.max_file_size));
                     }
                 }
             }
