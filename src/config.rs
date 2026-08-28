@@ -14,12 +14,37 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
+    #[serde(default = "default_rate_limit")]
+    pub rate_limit: RateLimitConfig,
     #[serde(skip)]
     api_key_index: HashMap<String, String>,
 }
 
 fn default_max_file_size() -> u64 {
     104_857_600 // 100 MB
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_rate_limit_max_requests")]
+    pub max_requests: u32,
+    #[serde(default = "default_rate_limit_window_secs")]
+    pub window_secs: u64,
+}
+
+fn default_rate_limit_max_requests() -> u32 {
+    100
+}
+
+fn default_rate_limit_window_secs() -> u64 {
+    60
+}
+
+fn default_rate_limit() -> RateLimitConfig {
+    RateLimitConfig {
+        max_requests: default_rate_limit_max_requests(),
+        window_secs: default_rate_limit_window_secs(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +162,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
             },
             max_file_size: default_max_file_size(),
+            rate_limit: default_rate_limit(),
             api_key_index: HashMap::new(),
         };
         config.build_index();
