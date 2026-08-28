@@ -51,9 +51,9 @@ pub struct ServerConfig {
 
 impl Config {
     pub fn find_account_for_bucket(&self, bucket: &str) -> Option<(&String, &AccountConfig)> {
-        self.accounts.iter().find(|(_, account)| {
-            account.buckets.contains(&bucket.to_string())
-        })
+        self.accounts
+            .iter()
+            .find(|(_, account)| account.buckets.contains(&bucket.to_string()))
     }
 
     pub fn find_user_by_api_key(&self, api_key: &str) -> Option<(&String, &UserConfig)> {
@@ -62,7 +62,8 @@ impl Config {
 
     pub fn is_bucket_allowed(&self, username: &str, bucket: &str) -> bool {
         if let Some(user) = self.users.get(username) {
-            user.allowed_buckets.contains(&"*".to_string()) || user.allowed_buckets.contains(&bucket.to_string())
+            user.allowed_buckets.contains(&"*".to_string())
+                || user.allowed_buckets.contains(&bucket.to_string())
         } else {
             false
         }
@@ -77,16 +78,15 @@ impl Config {
     }
 
     pub fn load(path: &str) -> Result<Self> {
-        info!("Loading configuration from {}", path);
-        
-        let file = File::open(path)
-            .map_err(|e| AppError::ConfigError(e))?;
-            
+        info!("Loading configuration from {path}");
+
+        let file = File::open(path)?;
+
         let reader = BufReader::new(file);
         let config = serde_json::from_reader(reader)
-            .map_err(|e| AppError::ConfigError(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-            
+            .map_err(|e| AppError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+
         info!("Successfully loaded configuration");
         Ok(config)
     }
-} 
+}
