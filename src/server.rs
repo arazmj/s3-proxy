@@ -1,12 +1,13 @@
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::{operation::get_object::GetObjectOutput, primitives::ByteStream};
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Extension, Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, put},
     Router,
 };
+use futures::stream;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -37,87 +38,6 @@ impl AppState {
     }
 }
 
-fn parse_range_header(value: &str) -> Result<String> {
-    let value = value.trim();
-    let spec = value
-        .strip_prefix("bytes=")
-        .ok_or_else(|| AppError::InvalidRequest("Invalid Range header".to_string()))?;
-
-    let (start, end) = spec
-        .split_once('-')
-        .ok_or_else(|| AppError::InvalidRequest("Invalid Range header".to_string()))?;
-
-    if start.is_empty() || !start.chars().all(|c| c.is_ascii_digit()) {
-        return Err(AppError::InvalidRequest("Invalid Range header".to_string()));
-    }
-
-    let start_value = start
-        .parse::<u64>()
-        .map_err(|_| AppError::InvalidRequest("Invalid Range header".to_string()))?;
-
-    if !end.is_empty() {
-        if !end.chars().all(|c| c.is_ascii_digit()) {
-            return Err(AppError::InvalidRequest("Invalid Range header".to_string()));
-        }
-
-        let end_value = end
-            .parse::<u64>()
-            .map_err(|_| AppError::InvalidRequest("Invalid Range header".to_string()))?;
-
-        if end_value < start_value {
-            return Err(AppError::InvalidRequest("Invalid Range header".to_string()));
-        }
-    }
-
-    Ok(value.to_string())
-}
-
-fn requested_range(headers: &HeaderMap) -> Result<Option<String>> {
-    headers
-        .get(header::RANGE)
-        .map(|value| {
-            let value = value
-                .to_str()
-                .map_err(|_| AppError::InvalidRequest("Invalid Range header".to_string()))?;
-            parse_range_header(value)
-        })
-        .transpose()
-}
-
-fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
-    if let Ok(value) = HeaderValue::from_str(value) {
-        headers.insert(name, value);
-    }
-}
-
-fn get_object_headers(response: &aws_sdk_s3::operation::get_object::GetObjectOutput) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
-
-    if let Some(content_type) = response.content_type() {
-        insert_header(&mut headers, "content-type", content_type);
-    } else {
-        headers.insert(
-            "content-type",
-            HeaderValue::from_static("application/octet-stream"),
-        );
-    }
-
-    if let Some(content_length) = response.content_length() {
-        insert_header(&mut headers, "content-length", &content_length.to_string());
-    }
-
-    if let Some(etag) = response.e_tag() {
-        insert_header(&mut headers, "etag", etag);
-    }
-
-    if let Some(content_range) = response.content_range() {
-        insert_header(&mut headers, "content-range", content_range);
-    }
-
-    headers
-}
-
 pub async fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/:bucket/*key", get(get_object))
@@ -130,36 +50,150 @@ pub async fn create_router(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
+fn parse_range_header(value: &str) -> Result<String> {
+    let value = value.trim();
+    let (unit, spec) = value
+        .split_once('=')
+        .ok_or_else(|| AppError::InvalidRequest("Invalid Range header".to_string()))?;
+
+    if !unit.eq_ignore_ascii_case("bytes") || spec.contains(',') {
+        return Err(AppError::InvalidRequest("Invalid Range header".to_string()));
+    }
+
+    let (start, end) = spec
+        .split_once('-')
+        .ok_or_else(|| AppError::InvalidRequest("Invalid Range header".to_string()))?;
+
+    if start.is_empty() && end.is_empty() {
+        return Err(AppError::InvalidRequest("Invalid Range header".to_string()));
+    }
+
+    let start_value = if start.is_empty() {
+        None
+    } else {
+        Some(
+            start
+                .parse::<u64>()
+                .map_err(|_| AppError::InvalidRequest("Invalid Range header".to_string()))?,
+        )
+    };
+
+    let end_value = if end.is_empty() {
+        None
+    } else {
+        Some(
+            end.parse::<u64>()
+                .map_err(|_| AppError::InvalidRequest("Invalid Range header".to_string()))?,
+        )
+    };
+
+    if let (Some(start), Some(end)) = (start_value, end_value) {
+        if end < start {
+            return Err(AppError::InvalidRequest("Invalid Range header".to_string()));
+        }
+    }
+
+    Ok(format!("bytes={spec}"))
+}
+
+fn requested_range(headers: &HeaderMap) -> Result<Option<String>> {
+    headers
+        .get(header::RANGE)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| AppError::InvalidRequest("Invalid Range header".to_string()))
+                .and_then(parse_range_header)
+        })
+        .transpose()
+}
+
 #[axum::debug_handler]
 #[instrument(skip(state), fields(bucket = %bucket, key = %key))]
 async fn get_object(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthState>,
     Path((bucket, key)): Path<(String, String)>,
-    headers: HeaderMap,
+    request_headers: HeaderMap,
 ) -> Result<impl IntoResponse> {
     info!("Getting object {}/{}", bucket, key);
 
     // Check bucket access
     check_bucket_access(&state.config, &auth.username, &bucket)?;
 
-    let range = requested_range(&headers)?;
+    let range = requested_range(&request_headers)?;
+    let is_range_request = range.is_some();
     let (_, client) = state.get_account_and_client(&bucket)?;
     let response = client.get_object(&bucket, &key, range).await?;
-    let status = if response.content_range().is_some() {
+    let headers = get_object_headers(&response);
+    let body_stream = stream::unfold(response.body, |mut byte_stream| async {
+        match byte_stream.try_next().await {
+            Ok(Some(bytes)) => Some((Ok::<Bytes, std::io::Error>(bytes), byte_stream)),
+            Ok(None) => None,
+            Err(error) => Some((Err(std::io::Error::other(error)), byte_stream)),
+        }
+    });
+    let body = Body::from_stream(body_stream);
+
+    let status = if is_range_request {
         StatusCode::PARTIAL_CONTENT
     } else {
         StatusCode::OK
     };
-    let headers = get_object_headers(&response);
-    let bytes = response
-        .body
-        .collect()
-        .await
-        .map_err(|e| AppError::InternalError(e.to_string()))?
-        .to_vec();
 
-    Ok((status, headers, bytes))
+    Ok((status, headers, body))
+}
+
+fn insert_header_if_valid(headers: &mut HeaderMap, name: HeaderName, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
+}
+
+fn get_object_headers(response: &GetObjectOutput) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+
+    if let Some(content_type) = response.content_type() {
+        insert_header_if_valid(&mut headers, header::CONTENT_TYPE, content_type);
+    }
+    if let Some(content_length) = response.content_length() {
+        insert_header_if_valid(
+            &mut headers,
+            header::CONTENT_LENGTH,
+            &content_length.to_string(),
+        );
+    }
+    if let Some(e_tag) = response.e_tag() {
+        insert_header_if_valid(&mut headers, header::ETAG, e_tag);
+    }
+    if let Some(last_modified) = response.last_modified() {
+        use aws_sdk_s3::primitives::DateTimeFormat;
+        if let Ok(last_modified) = last_modified.fmt(DateTimeFormat::HttpDate) {
+            insert_header_if_valid(&mut headers, header::LAST_MODIFIED, &last_modified);
+        }
+    }
+    if let Some(content_encoding) = response.content_encoding() {
+        insert_header_if_valid(&mut headers, header::CONTENT_ENCODING, content_encoding);
+    }
+    if let Some(content_range) = response.content_range() {
+        insert_header_if_valid(&mut headers, header::CONTENT_RANGE, content_range);
+    }
+    if let Some(cache_control) = response.cache_control() {
+        insert_header_if_valid(&mut headers, header::CACHE_CONTROL, cache_control);
+    }
+    if let Some(content_disposition) = response.content_disposition() {
+        insert_header_if_valid(
+            &mut headers,
+            header::CONTENT_DISPOSITION,
+            content_disposition,
+        );
+    }
+    if let Some(content_language) = response.content_language() {
+        insert_header_if_valid(&mut headers, header::CONTENT_LANGUAGE, content_language);
+    }
+
+    headers
 }
 
 #[axum::debug_handler]
@@ -276,30 +310,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn range_header_accepts_start_end() {
+    fn range_header_accepts_supported_forms() {
         assert_eq!(parse_range_header("bytes=0-499").unwrap(), "bytes=0-499");
-    }
-
-    #[test]
-    fn range_header_accepts_open_ended() {
         assert_eq!(parse_range_header("bytes=500-").unwrap(), "bytes=500-");
+        assert_eq!(parse_range_header("bytes=-500").unwrap(), "bytes=-500");
+        assert_eq!(parse_range_header("Bytes=0-0").unwrap(), "bytes=0-0");
     }
 
     #[test]
-    fn range_header_rejects_empty_spec() {
-        assert!(parse_range_header("bytes=").is_err());
+    fn range_header_rejects_invalid_or_multiple_ranges() {
+        for value in [
+            "bytes=",
+            "items=0-100",
+            "bytes=abc-100",
+            "bytes=0-abc",
+            "bytes=100-0",
+            "bytes=0-1,3-4",
+        ] {
+            assert!(parse_range_header(value).is_err(), "{value}");
+        }
     }
 
     #[test]
-    fn range_header_rejects_wrong_unit() {
-        assert!(parse_range_header("items=0-100").is_err());
-    }
+    fn get_object_headers_always_set_accept_ranges() {
+        let response = GetObjectOutput::builder().build();
+        let headers = get_object_headers(&response);
 
-    #[test]
-    fn range_header_rejects_negative_or_non_numeric() {
-        assert!(parse_range_header("bytes=-100").is_err());
-        assert!(parse_range_header("bytes=abc-100").is_err());
-        assert!(parse_range_header("bytes=0-abc").is_err());
+        assert_eq!(
+            headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes")
+        );
     }
 
     #[test]

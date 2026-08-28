@@ -82,7 +82,6 @@ impl S3Client {
         info!("Getting object {}/{} with range {:?}", bucket, key, range);
 
         let mut request = self.client.get_object().bucket(bucket).key(key);
-
         if let Some(range) = range {
             request = request.range(range);
         }
@@ -96,6 +95,9 @@ impl S3Client {
                             bucket.to_string(),
                             key.to_string(),
                         ));
+                    }
+                    if context.raw().status().as_u16() == 416 {
+                        return Err(AppError::RangeNotSatisfiable);
                     }
                 }
                 Err(e.into())
