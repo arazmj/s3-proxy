@@ -3,12 +3,14 @@ use axum::{
     body::{Body, Bytes},
     extract::{Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    middleware,
     response::IntoResponse,
     routing::get,
     Router,
 };
 use futures::{stream, TryStream};
 use http_body::Frame;
+use metrics_exporter_prometheus::PrometheusHandle;
 use pin_project_lite::pin_project;
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -19,7 +21,10 @@ use std::task::{Context, Poll};
 use sync_wrapper::SyncWrapper;
 use tracing::{info, instrument};
 
-use crate::auth::{auth_middleware, check_bucket_access, check_write_permission, AuthState};
+use crate::auth::{
+    auth_middleware, check_bucket_access, check_write_permission, security_headers_middleware,
+    AuthState,
+};
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::s3::{HeadObjectMetadata, ListObjectsParams, S3Client};
@@ -137,6 +142,7 @@ fn byte_stream_from_body(body: Body, limit: u64) -> (ByteStream, Arc<AtomicBool>
 pub struct AppState {
     pub config: Arc<Config>,
     pub clients: HashMap<String, Arc<S3Client>>,
+    pub prometheus_handle: PrometheusHandle,
 }
 
 impl AppState {
@@ -156,6 +162,7 @@ impl AppState {
 }
 
 pub async fn create_router(state: AppState) -> Router {
+    let config = state.config.clone();
     let state = Arc::new(state);
 
     let authenticated = Router::new()
@@ -167,18 +174,20 @@ pub async fn create_router(state: AppState) -> Router {
                 .delete(delete_object),
         )
         .route("/:bucket", get(list_objects))
-        .layer(axum::middleware::from_fn_with_state(
-            state.config.clone(),
-            auth_middleware,
-        ))
-        .with_state(state.clone());
+        .route_layer(middleware::from_fn_with_state(config, auth_middleware))
+        .route_layer(middleware::from_fn(crate::metrics::record_http_metrics));
 
     let health = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
-        .with_state(state);
+        .route_layer(middleware::from_fn(crate::metrics::record_http_metrics));
 
-    authenticated.merge(health)
+    Router::new()
+        .route("/metrics", get(metrics_handler))
+        .merge(authenticated)
+        .merge(health)
+        .with_state(state)
+        .layer(middleware::from_fn(security_headers_middleware))
 }
 
 fn health_headers() -> HeaderMap {
@@ -212,6 +221,17 @@ async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             r#"{"status":"not_ready"}"#,
         )
     }
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+    (StatusCode::OK, headers, state.prometheus_handle.render())
 }
 
 fn parse_range_header(value: &str) -> Result<String> {
@@ -286,9 +306,9 @@ async fn get_object(
     check_bucket_access(&state.config, &auth.username, &bucket)?;
 
     let range = requested_range(&request_headers)?;
-    let is_range_request = range.is_some();
     let (_, client) = state.get_account_and_client(&bucket)?;
     let response = client.get_object(&bucket, &key, range).await?;
+    let is_partial_response = response.content_range().is_some();
     let headers = get_object_headers(&response);
     let body_stream = stream::unfold(response.body, |mut byte_stream| async {
         match byte_stream.try_next().await {
@@ -299,7 +319,7 @@ async fn get_object(
     });
     let body = Body::from_stream(body_stream);
 
-    let status = if is_range_request {
+    let status = if is_partial_response {
         StatusCode::PARTIAL_CONTENT
     } else {
         StatusCode::OK
@@ -621,7 +641,16 @@ async fn list_objects(
 mod tests {
     use super::*;
     use axum::{body::to_bytes, http::Request};
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use tower::Service;
+
+    fn test_prometheus_handle() -> PrometheusHandle {
+        use std::sync::OnceLock;
+        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+        HANDLE
+            .get_or_init(|| PrometheusBuilder::new().install_recorder().unwrap())
+            .clone()
+    }
 
     fn list_view<'a>() -> ListObjectsResponseView<'a> {
         ListObjectsResponseView {
@@ -675,6 +704,7 @@ mod tests {
         let router = create_router(AppState {
             config: Arc::new(config),
             clients: HashMap::new(),
+            prometheus_handle: test_prometheus_handle(),
         })
         .await;
 
@@ -707,6 +737,7 @@ mod tests {
         AppState {
             config: Arc::new(config),
             clients: HashMap::new(),
+            prometheus_handle: test_prometheus_handle(),
         }
     }
 
@@ -735,6 +766,48 @@ mod tests {
 
         let missing_client = health_get("/readyz", true).await;
         assert_eq!(missing_client.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_is_unauthenticated_and_not_cached() {
+        let instrumented = health_get("/livez", false).await;
+        assert_eq!(instrumented.status(), StatusCode::OK);
+
+        let response = health_get("/metrics", false).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; version=0.0.4"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("http_requests_total"));
+        assert!(body.contains("route_template=\"/livez\""));
+    }
+
+    #[tokio::test]
+    async fn security_headers_cover_public_and_auth_error_responses() {
+        let public = health_get("/livez", false).await;
+        assert_eq!(public.headers()["X-Content-Type-Options"], "nosniff");
+        assert!(public.headers().get("X-XSS-Protection").is_none());
+
+        let mut router = create_router(health_test_state(false)).await;
+        let unauthorized = router
+            .call(
+                Request::builder()
+                    .uri("/bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unauthorized.headers()["Content-Security-Policy"],
+            "default-src 'none'; frame-ancestors 'none'"
+        );
     }
 
     #[test]

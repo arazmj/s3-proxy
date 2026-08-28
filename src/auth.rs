@@ -87,6 +87,12 @@ fn add_secure_headers(headers: &mut http::HeaderMap) {
     headers.insert("Referrer-Policy", "no-referrer".parse().unwrap());
 }
 
+pub async fn security_headers_middleware(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    add_secure_headers(response.headers_mut());
+    response
+}
+
 fn requires_write_permission(method: &http::Method) -> bool {
     matches!(*method, http::Method::PUT | http::Method::DELETE)
 }
@@ -385,10 +391,7 @@ pub async fn auth_middleware(
         role: format!("{:?}", user.role),
     });
 
-    // Process the request
-    let mut response = next.run(request).await;
-
-    add_secure_headers(response.headers_mut());
+    let response = next.run(request).await;
 
     info!(
         "Authenticated user: {} with role: {:?}",

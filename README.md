@@ -20,6 +20,7 @@ bucket name maps to exactly one configured backend account.
 - Three roles: `admin`, `user`, `readonly`. `admin` and `user` may write;
   `readonly` is GET-only.
 - Per-user sliding-window rate limiting (default 100 req/min).
+- Prometheus request counters and latency histograms at `/metrics`.
 - Configurable max upload size (default 100 MiB).
 - Path-traversal defense in the request validator (`.`, `..`, `//`,
   trailing `/` are rejected).
@@ -115,6 +116,7 @@ The `x-api-key` header is automatically redacted from request logs.
 | DELETE | `/{bucket}/{key}`     | Delete an object (writers only).                             |
 | GET    | `/livez`              | Unauthenticated process liveness check.                     |
 | GET    | `/readyz`             | Unauthenticated configuration/client readiness check.       |
+| GET    | `/metrics`            | Unauthenticated Prometheus metrics.                          |
 
 All requests must include `x-api-key: <value>`; otherwise the proxy responds
 with `401 Unauthorized`.
