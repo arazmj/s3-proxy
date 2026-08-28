@@ -112,12 +112,11 @@ impl Config {
     pub fn load(path: &str) -> Result<Self> {
         info!("Loading configuration from {}", path);
 
-        let file = File::open(path).map_err(|e| AppError::ConfigError(e))?;
+        let file = File::open(path)?;
 
         let reader = BufReader::new(file);
-        let mut config: Config = serde_json::from_reader(reader).map_err(|e| {
-            AppError::ConfigError(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
+        let mut config: Config = serde_json::from_reader(reader)
+            .map_err(|e| AppError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         config.build_index();
 
         info!("Successfully loaded configuration");
